@@ -1,0 +1,146 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy -- -D warnings
+      - run: cargo test --lib
+      - uses: cue-lang/setup-cue@v1.0.1
+        with:
+          version: v0.16.0
+      - run: cue vet ./schemas/...
+        working-directory: cue
+      - name: Build gantry-cue
+        run: cargo build -p gantry-cue
+      - name: Generate and verify sample setups
+        working-directory: samples
+        run: |
+          ../target/debug/gantry-cue setups/minimal
+          ../target/debug/gantry-cue setups/demo
+          test -f output/minimal/docker-compose.yml
+          test -f output/minimal/gantry.yaml
+          test -f output/demo/docker-compose.yml
+          test -f output/demo/gantry.yaml
+          test -f output/demo/services/app/entrypoint.sh
+          grep -q "probes:" output/demo/gantry.yaml
+          ! grep -q "8080:8080" output/demo/docker-compose.yml
+
+  e2e:
+    needs: check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: cue-lang/setup-cue@v1.0.1
+        with:
+          version: v0.16.0
+      - name: Build and generate
+        run: |
+          cargo build -p gantry-cue
+          docker build -t ghcr.io/chaoyi/gantry:latest .
+          cd samples && ../target/debug/gantry-cue setups/demo
+      - name: Start services
+        working-directory: samples/output/demo
+        run: |
+          docker compose build
+          docker compose up --no-start
+          docker compose start gantry
+      - name: Wait for supervisor
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:9090/api/status && break || sleep 1
+          done
+      - name: Converge integration target
+        run: |
+          result=$(curl -sf -X POST 'http://localhost:9090/api/converge/target/integration?timeout=60')
+          echo "$result" | python3 -m json.tool
+          started=$(echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d['actions']['started']))")
+          test "$started" -eq 4
+      - name: Fuzz operations
+        run: python3 tests/fuzz_ops.py 42 20
+      - name: Teardown
+        if: always()
+        working-directory: samples/output/demo
+        run: docker compose down --timeout 5
+
+  publish:
+    needs: [check, e2e]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@v2
+      - uses: cue-lang/setup-cue@v1.0.1
+        with:
+          version: v0.16.0
+
+      # Docker image
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # gantry-cue binary → GitHub Release (rolling "latest")
+      - name: Build gantry-cue static binary
+        env:
+          CARGO_PROFILE_RELEASE_LTO: "true"
+        run: cargo build --release --target x86_64-unknown-linux-musl -p gantry-cue
+      - name: Update rolling release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          prerelease: true
+          name: Latest build
+          files: target/x86_64-unknown-linux-musl/release/gantry-cue
+
+      # CUE module → GHCR
+      - name: Login CUE to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | cue login --token ghcr.io
+      - name: Publish CUE module
+        run: cue mod publish "v0.0.0-$(git rev-parse --short HEAD)"
+        working-directory: cue

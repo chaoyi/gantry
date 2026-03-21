@@ -1,0 +1,10 @@
+target/
+coverage/
+tests/
+.git/
+.github/
+*.profraw
+*.profdata
+justfile
+README.md
+LICENSE

@@ -1,0 +1,131 @@
+# Demo: 10 services, flaky cache in the middle
+#
+# Level 0: postgres, redis, rabbitmq (data)
+# Level 1: auth, cache (platform — cache is flaky)
+# Level 2: api, worker, mailer (application)
+# Level 3: web, admin (frontend)
+
+services:
+  postgres:
+    container: demo-postgres
+    probes:
+      port:
+        probe: { type: tcp, host: postgres, port: 5432, timeout: 15s }
+      ready:
+        probe: { type: log, success: "ready to accept connections", timeout: 30s }
+        depends_on: [postgres.port]
+
+  redis:
+    container: demo-redis
+    probes:
+      port:
+        probe: { type: tcp, host: redis, port: 6379, timeout: 10s }
+      ready:
+        probe: { type: log, success: "Ready to accept connections", timeout: 20s }
+        depends_on: [redis.port]
+
+  rabbitmq:
+    container: demo-rabbitmq
+    probes:
+      port:
+        probe: { type: tcp, host: rabbitmq, port: 5672, timeout: 15s }
+      ready:
+        probe: { type: log, success: "Time to start RabbitMQ", timeout: 30s }
+        depends_on: [rabbitmq.port]
+
+  auth:
+    container: demo-auth
+    start_after: [postgres.ready, redis.ready]
+    probes:
+      db:
+        probe: { type: log, success: "database connected", failure: "database error|connection refused", timeout: 15s }
+        depends_on: [postgres.ready]
+      sessions:
+        probe: { type: log, success: "session store connected", failure: "redis error|connection lost", timeout: 15s }
+        depends_on: [redis.ready]
+      http:
+        probe: { type: tcp, host: auth, port: 8082, timeout: 20s }
+        depends_on: [auth.db, auth.sessions]
+
+  cache:
+    container: demo-cache
+    start_after: [redis.ready]
+    probes:
+      init:
+        probe: { type: log, success: "initialized", timeout: 10s }
+      http:
+        probe: { type: tcp, host: cache, port: 9999, timeout: 10s }
+        depends_on: [cache.init, redis.ready]
+
+  api:
+    container: demo-api
+    start_after: [auth.http, cache.http]
+    probes:
+      auth:
+        probe: { type: log, success: "auth connected", timeout: 15s }
+        depends_on: [auth.http]
+      cache:
+        probe: { type: log, success: "cache connected", timeout: 15s }
+        depends_on: [cache.http]
+      http:
+        probe: { type: tcp, host: api, port: 8080, timeout: 20s }
+        depends_on: [api.auth, api.cache]
+
+  worker:
+    container: demo-worker
+    start_after: [auth.http, rabbitmq.ready]
+    probes:
+      auth:
+        probe: { type: log, success: "auth connected", timeout: 15s }
+        depends_on: [auth.http]
+      queue:
+        probe: { type: log, success: "consuming from queue", timeout: 15s }
+        depends_on: [rabbitmq.ready]
+      http:
+        probe: { type: tcp, host: worker, port: 8081, timeout: 10s }
+        depends_on: [worker.auth, worker.queue]
+
+  mailer:
+    container: demo-mailer
+    start_after: [rabbitmq.ready]
+    probes:
+      queue:
+        probe: { type: log, success: "consuming from queue", timeout: 15s }
+        depends_on: [rabbitmq.ready]
+      http:
+        probe: { type: tcp, host: mailer, port: 8081, timeout: 10s }
+        depends_on: [mailer.queue]
+
+  web:
+    container: demo-web
+    start_after: [api.http]
+    probes:
+      http:
+        probe: { type: tcp, host: web, port: 80, timeout: 10s }
+        depends_on: [api.http]
+
+  admin:
+    container: demo-admin
+    start_after: [api.http, worker.http]
+    probes:
+      http:
+        probe: { type: tcp, host: admin, port: 80, timeout: 10s }
+        depends_on: [api.http, worker.http]
+
+targets:
+  infra:
+    probes: [postgres.ready, redis.ready, rabbitmq.ready]
+  platform:
+    probes: [auth.ready, cache.ready]
+    depends_on: [infra]
+  backend:
+    probes: [api.ready, worker.ready, mailer.ready]
+    depends_on: [platform]
+  full:
+    probes: [web.ready, admin.ready]
+    depends_on: [backend]
+
+defaults:
+  tcp_probe_timeout: 10s
+  log_probe_timeout: 30s
+  probe_backoff: { initial: 100ms, max: 3s, multiplier: 2 }

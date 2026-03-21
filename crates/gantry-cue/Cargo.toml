@@ -1,0 +1,19 @@
+[package]
+name = "gantry-cue"
+description = "CUE-based configuration generator for Gantry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["docker", "cue", "codegen", "gantry"]
+
+[dependencies]
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+indexmap.workspace = true
+tera = "1"
+
+[dev-dependencies]
+gantry = { path = "../gantry" }

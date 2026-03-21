@@ -1,0 +1,28 @@
+default:
+    @just --list
+
+# Generate output from a setup (default: demo)
+generate setup='demo':
+    cd {{justfile_directory()}} && gantry-cue setups/{{setup}}
+
+# Generate and run a setup with docker compose
+up setup='demo': (generate setup)
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd {{justfile_directory()}}/output/{{setup}}
+    docker compose up --no-start
+    docker compose start gantry
+    echo ""
+    echo "  Gantry UI: http://localhost:9090"
+    echo "  Setup: {{setup}}"
+    echo "  Stop:  just down {{setup}}"
+    echo ""
+    docker compose logs -f gantry
+
+# Stop a running setup
+down setup='demo':
+    cd {{justfile_directory()}}/output/{{setup}} && docker compose down --timeout 5
+
+# List available setups
+list:
+    @ls setups/
