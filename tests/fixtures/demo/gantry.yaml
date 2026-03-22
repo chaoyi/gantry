@@ -1,0 +1,83 @@
+# Demo: 4 converge recovery behaviors
+#
+# crash-svc:  exits when redis down     → restart fixes it
+# stuck-svc:  broken when postgres down  → failure pattern detected, restart fixes it
+# slow-heal:  reconnects in ~20s         → restart is faster
+# fast-heal:  reconnects in ~2s          → self-heals, no restart needed
+
+services:
+  postgres:
+    container: demo-postgres
+    probes:
+      port:
+        probe: { type: tcp, host: postgres, port: 5432, timeout: 8s }
+      ready:
+        probe: { type: log, success: "ready to accept connections", timeout: 10s }
+        depends_on: [postgres.port]
+
+  redis:
+    container: demo-redis
+    probes:
+      port:
+        probe: { type: tcp, host: redis, port: 6379, timeout: 5s }
+      ready:
+        probe: { type: log, success: "Ready to accept connections", timeout: 8s }
+        depends_on: [redis.port]
+
+  crash-svc:
+    container: demo-crash-svc
+    start_after: [redis.ready]
+    probes:
+      dep:
+        probe: { type: log, success: "dependency connected", failure: "dependency lost", timeout: 5s }
+        depends_on: [redis.ready]
+      http:
+        probe: { type: tcp, host: crash-svc, port: 8080, timeout: 5s }
+        depends_on: [crash-svc.dep]
+
+  stuck-svc:
+    container: demo-stuck-svc
+    start_after: [postgres.ready]
+    probes:
+      dep:
+        probe: { type: log, success: "dependency connected", failure: "dependency check failed", timeout: 5s }
+        depends_on: [postgres.ready]
+      http:
+        probe: { type: tcp, host: stuck-svc, port: 8080, timeout: 5s }
+        depends_on: [stuck-svc.dep]
+
+  slow-heal:
+    container: demo-slow-heal
+    start_after: [redis.ready]
+    probes:
+      dep:
+        probe: { type: log, success: "dependency connected", failure: "dependency lost", timeout: 5s }
+        depends_on: [redis.ready]
+      http:
+        probe: { type: tcp, host: slow-heal, port: 8080, timeout: 5s }
+        depends_on: [slow-heal.dep]
+
+  fast-heal:
+    container: demo-fast-heal
+    restart_on_fail: false
+    start_after: [postgres.ready]
+    probes:
+      dep:
+        probe: { type: log, success: "dependency connected", timeout: 5s }
+        depends_on: [postgres.ready]
+      http:
+        probe: { type: tcp, host: fast-heal, port: 8080, timeout: 5s }
+        depends_on: [fast-heal.dep]
+
+targets:
+  infra:
+    probes: [postgres.ready, redis.ready]
+  app:
+    probes: [crash-svc.ready, stuck-svc.ready, slow-heal.ready, fast-heal.ready]
+    depends_on: [infra]
+
+defaults:
+  tcp_probe_timeout: 5s
+  log_probe_timeout: 8s
+  restart_on_fail: true
+  probe_backoff: { initial: 100ms, max: 2s, multiplier: 2 }

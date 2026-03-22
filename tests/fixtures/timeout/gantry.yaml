@@ -1,0 +1,19 @@
+# Timeout test fixture: one service with 10s boot delay
+services:
+  slow-boot:
+    container: timeout-slow-boot
+    probes:
+      ready:
+        probe: { type: log, success: "ready", timeout: 15s }
+      http:
+        probe: { type: tcp, host: slow-boot, port: 8080, timeout: 15s }
+        depends_on: [slow-boot.ready]
+
+targets:
+  all:
+    probes: [slow-boot.ready]
+
+defaults:
+  tcp_probe_timeout: 15s
+  log_probe_timeout: 15s
+  probe_backoff: { initial: 100ms, max: 2s, multiplier: 2 }

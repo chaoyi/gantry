@@ -1,0 +1,135 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: cue-lang/setup-cue@v1.0.1
+        with:
+          version: v0.16.0
+      - run: cargo fmt --check
+      - run: cargo clippy -- -D warnings
+      - run: cargo test --lib
+      - run: cue vet ./...
+        working-directory: cue
+      - name: Generate and verify sample
+        run: |
+          cargo build -p gantry-cue
+          cd samples
+          mkdir -p cue.mod/pkg/github.com/chaoyi/gantry
+          cp ../cue/gantry.cue cue.mod/pkg/github.com/chaoyi/gantry/
+          ../target/debug/gantry-cue setups/demo
+          test -f output/demo/docker-compose.yml
+          test -f output/demo/gantry.yaml
+          grep -q "probes:" output/demo/gantry.yaml
+          # Verify templated filename rendered
+          test -f output/demo/services/app/config-development.toml
+          # Verify volumes in compose
+          grep -q "volumes:" output/demo/docker-compose.yml
+          # Verify command in compose
+          grep -q "command:" output/demo/docker-compose.yml
+
+  e2e:
+    needs: check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build and start
+        run: |
+          docker buildx build --load --cache-from type=gha --cache-to type=gha,mode=max -t ghcr.io/chaoyi/gantry:latest .
+          cd tests/fixtures/demo
+          docker compose build
+          docker compose up --no-start
+          docker compose start gantry
+      - name: Wait for gantry
+        run: for i in $(seq 1 30); do curl -sf http://localhost:9090/api/graph && break || sleep 1; done
+      - name: Install test deps
+        run: pip install pytest requests
+      - name: Recovery tests
+        run: pytest tests/test_recovery.py tests/test_log_since.py -v --tb=short
+      - name: Fuzz
+        run: python3 tests/fuzz_ops.py 42 20
+      - name: Teardown
+        if: always()
+        run: cd tests/fixtures/demo && docker compose down --timeout 5 2>/dev/null || true
+
+  publish:
+    needs: [check, e2e]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@v2
+      - uses: cue-lang/setup-cue@v1.0.1
+        with:
+          version: v0.16.0
+
+      # Docker image
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # gantry-cue binary
+      - name: Build gantry-cue static binary
+        env:
+          CARGO_PROFILE_RELEASE_LTO: "true"
+        run: cargo build --release --target x86_64-unknown-linux-musl -p gantry-cue
+      - name: Update rolling release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          prerelease: true
+          name: Latest build
+          files: target/x86_64-unknown-linux-musl/release/gantry-cue
+
+      # CUE module (central registry)
+      - name: Login to CUE registry
+        uses: cue-labs/registry-login-action@main
+      - name: Publish CUE module
+        run: cue mod publish "v0.0.0-$(git rev-parse --short HEAD)"
+        working-directory: cue

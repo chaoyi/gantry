@@ -1,0 +1,21 @@
+# Timeout test: one slow-booting service
+services:
+  gantry:
+    image: ghcr.io/chaoyi/gantry:latest
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    container_name: timeout-gantry
+    environment:
+      RUST_LOG: gantry=debug
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./gantry.yaml:/etc/gantry/config.yaml:ro
+    ports:
+      - "9092:9090"
+
+  slow-boot:
+    build: ./slow-boot
+    container_name: timeout-slow-boot
+    environment:
+      BOOT_DELAY: "10"

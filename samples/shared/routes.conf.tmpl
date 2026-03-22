@@ -1,0 +1,7 @@
+upstream api {
+    server api:{{ api_port }};
+}
+
+upstream worker {
+    server worker:{{ worker_port }};
+}

@@ -1,0 +1,15 @@
+[package]
+name = "gantry-cue"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+indexmap.workspace = true
+tera = "1"
+
+[dev-dependencies]
+gantry = { path = "../gantry" }

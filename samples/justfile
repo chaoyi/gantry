@@ -1,0 +1,27 @@
+default:
+    @just --list
+
+vendor:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dest=cue.mod/pkg/github.com/chaoyi/gantry
+    rm -rf "$dest" && mkdir -p "$dest"
+    cp ../cue/gantry.cue "$dest/"
+
+check: vendor
+    cue vet ./...
+
+generate setup='demo': vendor
+    ../target/debug/gantry-cue setups/{{setup}}
+
+up setup='demo': (generate setup)
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd output/{{setup}}
+    docker compose build
+    docker compose up --no-start && docker compose start gantry
+    for i in $(seq 1 30); do curl -sf http://localhost:9090/api/graph > /dev/null && break || sleep 1; done
+    curl -sf -X POST 'http://localhost:9090/api/converge/target/integration?timeout=60' | python3 -m json.tool
+
+down setup='demo':
+    cd output/{{setup}} && docker compose down --timeout 5

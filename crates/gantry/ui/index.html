@@ -1,0 +1,1974 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gantry</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@300;400;500;600&display=swap');
+
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+  --green: #00aa44;
+  --green-glow: #00aa4455;
+  --red: #ff0000;
+  --red-glow: #ff000055;
+  --gray: #4c566a;
+  --gray-dim: #3b4252;
+  --bg: #1e222a;
+  --panel-bg: #252a34;
+  --card-bg: #2e3440;
+  --card-border: #3b4252;
+  --text: #d8dee9;
+  --text-dim: #7b88a1;
+  --text-bright: #eceff4;
+  --accent: #88c0d0;
+  --accent-dim: #88c0d033;
+  --edge-dep: #7b88a1;
+  --header-bg: #2e3440cc;
+  --font-mono: 'JetBrains Mono', 'IBM Plex Mono', 'Consolas', monospace;
+  --dim-opacity: 0.12;
+  --radius: 6px;
+  --radius-lg: 10px;
+}
+
+html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(--text); font-family: var(--font-mono); font-size: 12px; line-height: 1.5; }
+
+#app {
+  display: grid;
+  grid-template-columns: 240px 1fr 380px;
+  grid-template-rows: 40px 1fr;
+  height: 100vh;
+}
+
+/* ── HEADER BAR ────────────────────────────────────────── */
+#header {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  padding: 0 8px;
+  background: var(--panel-bg);
+  border-bottom: 1px solid var(--card-border);
+  gap: 8px;
+  z-index: 100;
+}
+#header .logo {
+  font-weight: 700;
+  font-size: 14px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: var(--text-bright);
+}
+#ws-status::before {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  margin-right: 4px;
+  vertical-align: middle;
+}
+#ws-status.connected::before { background: var(--green); box-shadow: 0 0 4px var(--green-glow); }
+#ws-status.disconnected::before { background: var(--red); box-shadow: 0 0 4px var(--red-glow); }
+#header .spacer { flex: 1; }
+#header .status-text { color: var(--text-dim); font-size: 11px; }
+#ws-status { color: var(--text-dim); font-size: 11px; }
+#ws-status.connected { color: var(--green); }
+#ws-status.disconnected { color: var(--red); }
+
+/* ── LEFT PANEL ────────────────────────────────────────── */
+#left-panel {
+  background: var(--panel-bg);
+  border-right: 1px solid var(--card-border);
+  overflow-y: auto;
+  padding: 8px 0;
+  scrollbar-width: thin;
+  scrollbar-color: var(--card-border) transparent;
+  transition: width 0.2s;
+}
+#left-panel.collapsed { width: 0 !important; min-width: 0; overflow: hidden; border: none; }
+#left-panel.collapsed .panel-section-header,
+#left-panel.collapsed #service-tree,
+#left-panel.collapsed #target-tree { display: none; }
+.panel-section-header {
+  padding: 8px 14px 4px 14px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  user-select: none;
+}
+.tree-node {
+  display: flex;
+  align-items: center;
+  padding: 3px 14px 3px 14px;
+  cursor: pointer;
+  gap: 8px;
+  transition: background 0.1s;
+  user-select: none;
+}
+.tree-node:hover { background: var(--card-border); }
+.tree-node.selected { background: var(--accent-dim); }
+.tree-node .chevron {
+  width: 12px;
+  font-size: 10px;
+  color: var(--text-dim);
+  transition: transform 0.15s;
+  flex-shrink: 0;
+}
+.tree-node .chevron.open { transform: rotate(90deg); }
+.tree-node .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.tree-node.probe-node .dot {
+  width: 5px;
+  height: 5px;
+}
+.tree-node .label { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tree-node.probe-node { padding-left: 34px; font-size: 11px; color: var(--text-dim); }
+.tree-node.probe-node:hover { color: var(--text); }
+.runtime-label { font-size: 9px; color: #4c566a; margin-left: auto; flex-shrink: 0; }
+.tree-node .type-badge {
+  font-size: 8px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: var(--card-border);
+  color: var(--text-dim);
+  flex-shrink: 0;
+  margin-left: auto;
+}
+.tree-probes { overflow: hidden; }
+.tree-probes.collapsed { display: none; }
+
+.dot-green { background: #00aa44; box-shadow: 0 0 4px #00aa4455; }
+.dot-red { background: #ff0000; box-shadow: 0 0 4px #ff000055; }
+.dot-stale { background: #4c566a; box-shadow: 0 0 4px #4c566a55; animation: dotPulse 2s ease-in-out infinite; }
+@keyframes dotPulse { 0%, 100% { opacity: 0.5; } 50% { opacity: 1; } }
+.dot-gray { background: #4c566a; }
+.dot-stopped { background: #3b4252; opacity: 0.5; }
+
+/* ── CENTER (GRAPH) ────────────────────────────────────── */
+#center {
+  position: relative;
+  overflow: hidden;
+  background: var(--bg);
+}
+#center::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background:
+    repeating-linear-gradient(0deg, transparent, transparent 23px, #2e344018 23px, #2e344018 24px),
+    repeating-linear-gradient(90deg, transparent, transparent 23px, #2e344018 23px, #2e344018 24px);
+  pointer-events: none;
+}
+#graph-svg {
+  width: 100%;
+  height: 100%;
+  cursor: grab;
+}
+#graph-svg:active { cursor: grabbing; }
+#graph-svg text { font-family: var(--font-mono); pointer-events: none; }
+
+/* SVG node styles */
+.svc-card { cursor: pointer; }
+.svc-header-bg { rx: 6; ry: 6; }
+.svc-body-bg { rx: 0; ry: 0; }
+.svc-header-text { fill: var(--text-bright); font-size: 12px; font-weight: 600; }
+.svc-runtime-text { fill: #4c566a; font-size: 8px; font-weight: 400; }
+.probe-text { fill: var(--text-dim); font-size: 11px; }
+@keyframes svgDotPulse { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; } }
+.dot-stale-svg { animation: svgDotPulse 2s ease-in-out infinite; }
+@keyframes dotProbing { 0%, 100% { opacity: 0.3; } 50% { opacity: 1; } }
+@keyframes nodeFlashAnim { 0% { opacity: 0.5; } 100% { opacity: 0; } }
+.probe-dep-label { fill: #4c566a; font-size: 8px; }
+.probe-type-text { fill: var(--text-dim); font-size: 9px; font-weight: 300; opacity: 0.6; }
+.probe-hit { fill: transparent; cursor: pointer; }
+.probe-hit:hover { fill: #d8dee908; }
+.target-card { cursor: pointer; }
+.target-bg { rx: 16; ry: 16; }
+.target-text { fill: var(--text-bright); font-size: 12px; font-weight: 600; }
+.target-badge { font-size: 8px; font-weight: 600; fill: var(--text-dim); }
+
+.edge-start-after { fill: none; stroke: #4c566a; stroke-width: 1.5; opacity: 0.5; }
+.edge-depends-on { fill: none; stroke: #4c566a; stroke-width: 1; opacity: 0.3; }
+.edge-target { fill: none; stroke: #4c566a; stroke-width: 1; opacity: 0.35; }
+.edge-target-dep { fill: none; stroke: #4c566a; stroke-width: 1; opacity: 0.3; }
+.intra-arc { stroke: #4c566a; opacity: 0.35; }
+@keyframes edgePulse { 0%, 100% { opacity: 0.15; } 50% { opacity: 0.6; } }
+.edge-pulse { animation: edgePulse 1.5s ease-in-out infinite; }
+@keyframes edgeFlow { from { stroke-dashoffset: 16; } to { stroke-dashoffset: 0; } }
+.edge-flow { stroke-dasharray: 8 8; animation: edgeFlow 0.8s linear infinite; }
+
+/* ── RIGHT PANEL (EVENTS) ─────────────────────────────── */
+#right-panel {
+  background: var(--panel-bg);
+  border-left: 1px solid var(--card-border);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  transition: width 0.2s;
+}
+#right-panel.collapsed { width: 0 !important; min-width: 0; overflow: hidden; border: none; }
+#right-panel.collapsed #event-header .row,
+#right-panel.collapsed #event-list,
+#right-panel.collapsed #new-events-btn { display: none; }
+.collapse-btn { background: none; border: none; color: var(--text-dim); cursor: pointer; font-size: 14px; padding: 0 4px; flex-shrink: 0; }
+.collapse-btn:hover { color: var(--text-bright); }
+.panel-close { background: none; border: none; color: var(--text-dim); cursor: pointer; font-size: 10px; padding: 0 2px; opacity: 0.4; }
+.panel-close:hover { opacity: 1; color: var(--text-bright); }
+#event-header {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--card-border);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex-shrink: 0;
+}
+#event-header .row { display: flex; gap: 6px; align-items: center; }
+.verbose-toggle { display: flex; align-items: center; gap: 4px; cursor: pointer; user-select: none; flex-shrink: 0; font-size: 11px; color: var(--text-dim); border: 1px solid var(--card-border); border-radius: 4px; padding: 2px 6px; }
+.verbose-toggle:hover { border-color: var(--text-dim); }
+.verbose-toggle input { display: none; }
+.verbose-toggle span { opacity: 0.5; transition: opacity 0.15s; }
+.verbose-toggle input:checked + span { opacity: 1; color: var(--text); }
+#event-clear { background: none; border: 1px solid var(--card-border); color: var(--text-dim); border-radius: 4px; padding: 2px 6px; cursor: pointer; font-size: 11px; flex-shrink: 0; }
+#event-clear:hover { color: var(--text); border-color: var(--text-dim); }
+#event-search {
+  background: var(--card-bg);
+  color: var(--text);
+  border: 1px solid var(--card-border);
+  border-radius: 4px;
+  padding: 3px 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  outline: none;
+}
+#event-search { flex: 1; }
+#event-search:focus { border-color: var(--accent); }
+#event-list {
+  flex: 1;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--card-border) transparent;
+  padding: 4px 0;
+}
+.event-row {
+  padding: 3px 12px;
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: 11px;
+  cursor: pointer;
+  transition: background 0.1s;
+  line-height: 1.4;
+}
+.event-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  margin-top: 6px;
+}
+.event-dot-lg {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  margin-top: 5px;
+}
+.event-dot-spacer { width: 6px; flex-shrink: 0; }
+.event-ok { color: var(--green); font-weight: bold; }
+.event-fail { color: var(--red); font-weight: bold; }
+.event-row:hover { background: #2e344066; }
+.event-row .ts { color: var(--text-dim); white-space: nowrap; font-size: 10px; flex-shrink: 0; }
+.event-row .badge {
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  padding: 1px 3px;
+  border-radius: 3px;
+  text-transform: uppercase;
+  flex-shrink: 0;
+  width: 28px;
+  text-align: center;
+}
+.badge-service { background: #5e81ac33; color: #81a1c1; }
+.badge-probe_state { background: #a3be8c33; color: #a3be8c; }
+.badge-probe { background: #4c566a; color: var(--text-dim); }
+.badge-target { background: #b48ead33; color: #b48ead; }
+.badge-op { background: #d0877033; color: #d08770; }
+.badge-restart { background: #bf616a33; color: #bf616a; }
+.badge-message { background: #5e81ac55; color: #88c0d0; }
+.event-row .summary { flex: 1; word-break: break-word; }
+.event-row .expand-btn {
+  color: var(--text-dim);
+  cursor: pointer;
+  flex-shrink: 0;
+  font-size: 10px;
+  width: 14px;
+  text-align: center;
+}
+.event-row .expand-btn:hover { color: var(--text); }
+.event-detail {
+  display: none;
+  padding: 2px 12px 6px 85px;
+  font-size: 10px;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.event-detail.open { display: block; }
+#new-events-btn {
+  display: none;
+  position: absolute;
+  bottom: 8px;
+  right: 328px;
+  background: var(--accent);
+  color: #000;
+  border: none;
+  border-radius: 12px;
+  padding: 4px 12px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  z-index: 10;
+}
+
+/* ── CONTEXT MENU ──────────────────────────────────────── */
+#context-menu {
+  position: fixed;
+  background: var(--panel-bg);
+  border: 1px solid var(--card-border);
+  border-radius: var(--radius);
+  padding: 4px 0;
+  min-width: 160px;
+  z-index: 1000;
+  box-shadow: 0 8px 24px #00000088;
+  display: none;
+}
+.menu-item {
+  padding: 6px 14px;
+  cursor: pointer;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  transition: background 0.1s;
+}
+.menu-item:hover { background: var(--accent-dim); }
+.menu-item .icon { width: 14px; color: var(--text-dim); font-size: 10px; }
+.menu-sep { height: 1px; background: var(--card-border); margin: 4px 0; }
+
+/* ── TOAST ─────────────────────────────────────────────── */
+#toast {
+  display: none;
+  position: fixed;
+  bottom: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 8px 20px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-family: var(--font-mono);
+  z-index: 1000;
+  transition: opacity 0.3s;
+  pointer-events: none;
+}
+.toast-pending { background: var(--panel-bg); color: var(--accent); border: 1px solid var(--accent); }
+.toast-ok { background: #2a3328; color: var(--green); border: 1px solid var(--green); }
+.toast-fail { background: #382830; color: var(--red); border: 1px solid var(--red); }
+
+/* ── LOADING ───────────────────────────────────────────── */
+#loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-dim);
+  font-size: 13px;
+  z-index: 50;
+  background: var(--bg);
+}
+@keyframes pulse { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; } }
+#loading span { animation: pulse 1.5s ease-in-out infinite; }
+
+/* ── ANIMATIONS ────────────────────────────────────────── */
+@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+.event-row { animation: fadeIn 0.15s ease-out; }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--card-border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #616e88; }
+</style>
+</head>
+<body>
+
+<div id="app">
+  <div id="header">
+    <button class="collapse-btn" id="left-collapse" title="Toggle tree panel">&#x2261;</button>
+    <div class="logo" id="logo">Gantry</div>
+    <div class="spacer"></div>
+    <span id="ws-status">connected</span>
+    <button class="collapse-btn" id="event-collapse" title="Toggle event panel">&#x2261;</button>
+  </div>
+  <div id="left-panel" style="position:relative">
+    <button class="panel-close" id="left-close" title="Close" style="position:absolute;top:4px;right:6px;z-index:1">&#x2715;</button>
+    <div class="panel-section-header">Services</div>
+    <div id="service-tree"></div>
+    <div class="panel-section-header" style="margin-top:8px">Targets</div>
+    <div id="target-tree"></div>
+  </div>
+  <div id="center">
+    <div id="loading"><span>loading graph...</span></div>
+    <svg id="graph-svg"><g id="graph-root"></g></svg>
+  </div>
+  <div id="right-panel">
+    <div id="event-header">
+      <div class="row">
+        <input id="event-search" type="text" placeholder="filter...">
+        <label class="verbose-toggle"><input type="checkbox" id="event-verbose"><span>verbose</span></label>
+        <button id="event-clear" title="Clear events">clr</button>
+        <button class="panel-close" id="right-close" title="Close">&#x2715;</button>
+      </div>
+    </div>
+    <div id="event-list"></div>
+  </div>
+  <button id="new-events-btn">new events</button>
+</div>
+
+<div id="context-menu"></div>
+
+<script>
+// ══════════════════════════════════════════════════════════════════════
+// STATE
+// ══════════════════════════════════════════════════════════════════════
+const S = {
+  graph: null,       // from /api/graph
+  services: {},      // name -> { state, probes: { probe: { state } } }
+  targets: {},       // name -> { state }
+  events: [],
+  selection: null,   // { type: 'probe'|'service'|'target', id }
+  layout: null,
+  transform: { x: 0, y: 0, scale: 1 },
+  autoScroll: true,
+  wsRetryDelay: 1000,
+};
+
+// ══════════════════════════════════════════════════════════════════════
+// CONSTANTS
+// ══════════════════════════════════════════════════════════════════════
+const CARD_W = 160;
+const HEADER_H = 28;
+const PROBE_H = 22;
+const CARD_PAD = 2;
+const LEVEL_GAP = 280;
+const NODE_GAP = 20;
+const TARGET_W = 130;
+const TARGET_H = 36;
+const MAX_EVENTS = 1000;
+
+// ══════════════════════════════════════════════════════════════════════
+// UTILITIES
+// ══════════════════════════════════════════════════════════════════════
+// Visual state colors:
+//   green   - all probes green, healthy
+//   red     - at least one probe probed and failed, or service crashed
+//   stale   - some probes stale, none red
+//   pending - service running but probes not yet checked (all red, no probe history)
+// State colors — consistent across graph SVG and tree panel:
+//   green   = #00aa44 (LED green)
+//   red     = #ff0000 (LED red)
+//   stale   = #4c566a (gray, pulsing — needs reprobe)
+//   stopped = #3b4252 (dim gray — inactive)
+function stateBgFill(st) {
+  if (st === 'green') return '#1f3330';
+  if (st === 'red' || st === 'crashed') return '#4a2028';
+  if (st === 'stale') return '#252830';
+  if (st === 'stopped') return '#1e2228';
+  return '#2e3440';
+}
+function stateColor(st) {
+  if (st === 'green') return '#00aa44';
+  if (st === 'red' || st === 'crashed') return '#ff0000';
+  if (st === 'stale') return '#4c566a';
+  if (st === 'stopped') return '#3b4252';
+  return '#4c566a';
+}
+// Dependency context: green, red, or gray-pulsing (stale).
+function depColor(st) {
+  if (st === 'green') return stateColor('green');
+  if (st === 'stale') return stateColor('stale'); // gray, pulsing handled by class
+  return stateColor('red');
+}
+function stateDotClass(st) {
+  if (st === 'green') return 'dot-green';
+  if (st === 'red' || st === 'crashed') return 'dot-red';
+  if (st === 'stale') return 'dot-stale';
+  if (st === 'stopped') return 'dot-stopped';
+  return 'dot-gray';
+}
+function svcBgState(svc) {
+  return probeState(svc.name, 'ready');
+}
+function probeState(svc, probe) {
+  return S.services[svc]?.probes?.[probe]?.state || 'stopped';
+}
+function targetState(name) {
+  return S.targets[name]?.state || 'stopped';
+}
+function visibleProbes(svc) {
+  return svc.probes.filter(c => c.name !== 'ready');
+}
+function svcCardH(svc) {
+  return HEADER_H + visibleProbes(svc).length * PROBE_H + CARD_PAD * 2;
+}
+function svgEl(tag, attrs) {
+  const el = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  for (const [k, v] of Object.entries(attrs || {})) el.setAttribute(k, v);
+  return el;
+}
+function bezier(x1, y1, x2, y2) {
+  const dx = Math.abs(x2 - x1) * 0.45;
+  return `M${x1},${y1} C${x1 + dx},${y1} ${x2 - dx},${y2} ${x2},${y2}`;
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// LAYOUT (ELK.js powered)
+// ══════════════════════════════════════════════════════════════════════
+const Layout = {
+  async compute(graph) {
+    const svcs = graph.services;
+    const tgts = graph.targets;
+    const svcMap = {};
+    for (const s of svcs) svcMap[s.name] = s;
+
+    // Compute direct probes per target
+    const tgtMap = {};
+    for (const t of tgts) tgtMap[t.name] = t;
+    for (const t of tgts) {
+      const inherited = new Set();
+      for (const dep of (t.depends_on || [])) {
+        const dt = tgtMap[dep];
+        if (dt) for (const c of dt.probes) inherited.add(c);
+      }
+      t._directProbes = t.probes.filter(c => !inherited.has(c));
+    }
+
+    // Build ELK graph — services only. Targets positioned manually.
+    const elkNodes = [];
+    const elkEdges = [];
+    let edgeId = 0;
+
+    for (const svc of svcs) {
+      const h = svcCardH(svc);
+      const ports = [];
+      for (let ci = 0; ci < svc.probes.length; ci++) {
+        const probe = svc.probes[ci];
+        const py = HEADER_H + CARD_PAD + ci * PROBE_H + PROBE_H / 2;
+        ports.push({ id: `${svc.name}.${probe.name}.out`, width: 1, height: 1,
+          layoutOptions: { 'port.side': 'EAST', 'port.index': String(ci) },
+          x: CARD_W, y: py });
+        ports.push({ id: `${svc.name}.${probe.name}.in`, width: 1, height: 1,
+          layoutOptions: { 'port.side': 'WEST', 'port.index': String(ci) },
+          x: 0, y: py });
+      }
+      ports.push({ id: `${svc.name}.header.in`, width: 1, height: 1,
+        layoutOptions: { 'port.side': 'WEST', 'port.index': '99' },
+        x: 0, y: HEADER_H / 2 });
+
+      elkNodes.push({ id: svc.name, width: CARD_W, height: h, ports,
+        layoutOptions: { 'portConstraints': 'FIXED_POS' } });
+    }
+
+    // Service edges only
+    for (const svc of svcs) {
+      for (const ref of svc.start_after) {
+        elkEdges.push({ id: `e${edgeId++}`,
+          sources: [`${ref}.out`], targets: [`${svc.name}.header.in`] });
+      }
+      for (const probe of svc.probes) {
+        for (const ref of (probe.depends_on || [])) {
+          const depSvc = ref.split('.')[0];
+          if (depSvc === svc.name) continue;
+          elkEdges.push({ id: `e${edgeId++}`,
+            sources: [`${ref}.out`], targets: [`${svc.name}.${probe.name}.in`] });
+        }
+      }
+    }
+
+    const elkGraph = {
+      id: 'root',
+      layoutOptions: {
+        'algorithm': 'layered',
+        'direction': 'RIGHT',
+        'spacing.nodeNode': '24',
+        'spacing.nodeNodeBetweenLayers': '80',
+        'spacing.edgeNode': '20',
+        'spacing.edgeEdge': '12',
+        'spacing.componentComponent': '40',
+        'nodePlacement.strategy': 'NETWORK_SIMPLEX',
+        'nodePlacement.favorStraightEdges': 'true',
+        'layering.strategy': 'NETWORK_SIMPLEX',
+        'crossingMinimization.strategy': 'LAYER_SWEEP',
+      },
+      children: elkNodes,
+      edges: elkEdges,
+    };
+
+    const elk = new ELK();
+    const result = await elk.layout(elkGraph);
+
+    // Convert ELK service positions
+    const positions = {};
+    let maxX = 0;
+    let svcMinY = Infinity, svcMaxY = -Infinity;
+    for (const node of result.children) {
+      positions[node.id] = {
+        x: node.x, y: node.y, w: node.width, h: node.height, type: 'service',
+      };
+      maxX = Math.max(maxX, node.x + node.width);
+      svcMinY = Math.min(svcMinY, node.y);
+      svcMaxY = Math.max(svcMaxY, node.y + node.height);
+    }
+
+    // Position targets manually: single column to the right, ordered by depth (leaf top, aggregate bottom)
+    const tgtDepth = {};
+    function calcDepth(name) {
+      if (tgtDepth[name] !== undefined) return tgtDepth[name];
+      const t = tgtMap[name];
+      if (!t || !t.depends_on?.length) { tgtDepth[name] = 0; return 0; }
+      tgtDepth[name] = 0;
+      tgtDepth[name] = Math.max(...t.depends_on.map(d => calcDepth(d) + 1));
+      return tgtDepth[name];
+    }
+    for (const t of tgts) calcDepth(t.name);
+
+    const sortedTgts = [...tgts].sort((a, b) => (tgtDepth[a.name] || 0) - (tgtDepth[b.name] || 0));
+    const tgtX = maxX + 100; // river gap
+    const tgtRowH = (t) => {
+      const rows = (t.depends_on || []).length + (t._directProbes || []).length;
+      return HEADER_H + rows * PROBE_H + CARD_PAD * 2;
+    };
+    const totalTgtH = sortedTgts.reduce((s, t) => s + tgtRowH(t) + NODE_GAP, -NODE_GAP);
+    const svcMidY = (svcMinY + svcMaxY) / 2;
+    let tgtY = svcMidY - totalTgtH / 2;
+    for (const t of sortedTgts) {
+      const h = tgtRowH(t);
+      positions[`target:${t.name}`] = {
+        x: tgtX, y: tgtY, w: TARGET_W, h,
+        type: 'target', directProbes: t._directProbes || [], dependsOn: t.depends_on || [],
+      };
+      tgtY += h + NODE_GAP;
+    }
+
+    return positions;
+  },
+
+  probeAnchor(positions, svcName, probeIdx, side) {
+    const p = positions[svcName];
+    if (!p) return { x: 0, y: 0 };
+    const cy = p.y + HEADER_H + CARD_PAD + probeIdx * PROBE_H + PROBE_H / 2;
+    return { x: side === 'left' ? p.x : p.x + p.w, y: cy };
+  },
+
+  svcHeaderAnchor(positions, svcName, side) {
+    const p = positions[svcName];
+    if (!p) return { x: 0, y: 0 };
+    return { x: side === 'left' ? p.x : p.x + p.w, y: p.y + HEADER_H / 2 };
+  },
+
+  targetAnchor(positions, tgtName, side) {
+    const p = positions[`target:${tgtName}`];
+    if (!p) return { x: 0, y: 0 };
+    return { x: side === 'left' ? p.x : p.x + p.w, y: p.y + HEADER_H / 2 };
+  },
+
+  targetProbeAnchor(positions, tgtName, probeIdx, side) {
+    const p = positions[`target:${tgtName}`];
+    if (!p) return { x: 0, y: 0 };
+    const cy = p.y + HEADER_H + CARD_PAD + probeIdx * PROBE_H + PROBE_H / 2;
+    return { x: side === 'left' ? p.x : p.x + p.w, y: cy };
+  }
+};
+
+// ══════════════════════════════════════════════════════════════════════
+// GRAPH RENDERER
+// ══════════════════════════════════════════════════════════════════════
+const Graph = {
+  root: null,
+  edgeGroup: null,
+  nodeGroup: null,
+  fgGroup: null, // foreground: highlighted arcs render on top
+  elements: {},
+
+  render(graph, positions) {
+    this.root = document.getElementById('graph-root');
+    this.root.innerHTML = '';
+    this.elements = {};
+
+    this.edgeGroup = svgEl('g', { id: 'edges' });
+    this.nodeGroup = svgEl('g', { id: 'nodes' });
+    this.fgGroup = svgEl('g', { id: 'fg' });
+    this.root.appendChild(this.edgeGroup);
+    this.root.appendChild(this.nodeGroup);
+    this.root.appendChild(this.fgGroup);
+
+    const svcMap = {};
+    for (const s of graph.services) svcMap[s.name] = s;
+
+    // Helper: find probe anchor — ready probes route to header, others to visible row
+    function probeAnchorFor(svcName, probeName, side) {
+      if (probeName === 'ready') return Layout.svcHeaderAnchor(positions, svcName, side);
+      const svc = svcMap[svcName];
+      if (!svc) return { x: 0, y: 0 };
+      const vis = visibleProbes(svc);
+      const idx = vis.findIndex(c => c.name === probeName);
+      if (idx < 0) return Layout.svcHeaderAnchor(positions, svcName, side);
+      return Layout.probeAnchor(positions, svcName, idx, side);
+    }
+
+    // Draw edges
+    for (const svc of graph.services) {
+      // start_after edges: probe → service header (solid, prominent)
+      for (const ref of svc.start_after) {
+        const [depSvc, depProbe] = ref.split('.');
+        if (!svcMap[depSvc]) continue;
+        const from = probeAnchorFor(depSvc, depProbe, 'right');
+        const to = Layout.svcHeaderAnchor(positions, svc.name, 'left');
+        const path = svgEl('path', {
+          d: bezier(from.x, from.y, to.x, to.y),
+          class: 'edge-start-after',
+          'data-from': `${depSvc}.${depProbe}`,
+          'data-to': svc.name,
+          'data-type': 'start_after',
+        });
+        this.edgeGroup.appendChild(path);
+      }
+      // depends_on edges: probe → probe (solid, thinner) — skip ready and intra-service
+      const svcVisProbes = visibleProbes(svc);
+      for (let ci = 0; ci < svcVisProbes.length; ci++) {
+        const probe = svcVisProbes[ci];
+        for (const ref of (probe.depends_on || [])) {
+          const [depSvc, depProbe] = ref.split('.');
+          if (!depSvc || !depProbe) continue;
+          if (depSvc === svc.name) continue;
+          if (!svcMap[depSvc]) continue;
+          const from = probeAnchorFor(depSvc, depProbe, 'right');
+          const to = Layout.probeAnchor(positions, svc.name, ci, 'left');
+          const path = svgEl('path', {
+            d: bezier(from.x, from.y, to.x, to.y),
+            class: 'edge-depends-on',
+            'data-from': ref,
+            'data-to': `${svc.name}.${probe.name}`,
+            'data-type': 'depends_on',
+          });
+          this.edgeGroup.appendChild(path);
+        }
+      }
+    }
+
+    // Target edges — only draw from DIRECT probes (not transitive)
+    // We need to figure out which probes are direct vs inherited from depends_on targets
+    const tgtMap = {};
+    for (const t of graph.targets) tgtMap[t.name] = t;
+
+    for (const tgt of graph.targets) {
+      // Collect probes from dependent targets to exclude
+      const inheritedProbes = new Set();
+      for (const depName of (tgt.depends_on || [])) {
+        const depTgt = tgtMap[depName];
+        if (depTgt) for (const c of depTgt.probes) inheritedProbes.add(c);
+      }
+
+      // Draw edges only from direct (non-inherited) probes → target probe rows
+      const directProbes = positions[`target:${tgt.name}`]?.directProbes || [];
+      const depOffset = (positions[`target:${tgt.name}`]?.dependsOn || []).length;
+      for (let ti = 0; ti < directProbes.length; ti++) {
+        const ref = directProbes[ti];
+        const [depSvc, depProbe] = ref.split('.');
+        if (!svcMap[depSvc]) continue;
+        const from = probeAnchorFor(depSvc, depProbe, 'right');
+        const to = Layout.targetProbeAnchor(positions, tgt.name, depOffset + ti, 'left');
+        const path = svgEl('path', {
+          d: bezier(from.x, from.y, to.x, to.y),
+          class: 'edge-target',
+          'data-from': ref,
+          'data-to': `target:${tgt.name}`,
+          'data-type': 'target',
+        });
+        this.edgeGroup.appendChild(path);
+      }
+
+      // Draw target-to-target dependency edges (connect to the dep row)
+      const depTargets = positions[`target:${tgt.name}`]?.dependsOn || [];
+      for (let di = 0; di < depTargets.length; di++) {
+        const depName = depTargets[di];
+        const from = Layout.targetAnchor(positions, depName, 'right');
+        const to = Layout.targetProbeAnchor(positions, tgt.name, di, 'left');
+        const path = svgEl('path', {
+          d: bezier(from.x, from.y, to.x, to.y),
+          class: 'edge-target-dep',
+          'data-from': `target:${depName}`,
+          'data-to': `target:${tgt.name}`,
+          'data-type': 'target-dep',
+        });
+        this.edgeGroup.appendChild(path);
+      }
+    }
+
+    // Draw service nodes
+    for (const svc of graph.services) {
+      const p = positions[svc.name];
+      const g = svgEl('g', { class: 'svc-card', 'data-svc': svc.name, transform: `translate(${p.x},${p.y})` });
+      g.addEventListener('contextmenu', (e) => { e.preventDefault(); ContextMenu.showService(e, svc.name); });
+
+      // Card background
+      const bg = svgEl('rect', { width: p.w, height: p.h, rx: 6, ry: 6, fill: 'var(--card-bg)', stroke: 'var(--card-border)', 'stroke-width': 1, 'data-bg': svc.name });
+      g.appendChild(bg);
+
+      // Header
+      const headerBg = svgEl('rect', { width: p.w, height: HEADER_H, rx: 6, ry: 6, fill: '#1e222a33' });
+      g.appendChild(headerBg);
+      // Bottom corners overlap fix
+      const headerFix = svgEl('rect', { y: HEADER_H - 6, width: p.w, height: 6, fill: '#1e222a33' });
+      g.appendChild(headerFix);
+
+      // Status dot in header
+      const dot = svgEl('circle', { cx: 14, cy: HEADER_H / 2, r: 4, fill: 'var(--gray)', 'data-dot': `svc:${svc.name}` });
+      g.appendChild(dot);
+
+      // Service name
+      g.appendChild(svgEl('text', { x: 26, y: HEADER_H / 2 + 4, class: 'svc-header-text', 'data-svc': svc.name })).textContent = svc.name;
+
+      // Runtime state label (right-aligned in header)
+      g.appendChild(svgEl('text', { x: p.w - 6, y: HEADER_H / 2 + 3, class: 'svc-runtime-text', 'text-anchor': 'end', 'data-runtime': svc.name }));
+
+      // Header click area
+      const headerHit = svgEl('rect', { width: p.w, height: HEADER_H, fill: 'transparent', cursor: 'pointer' });
+      headerHit.addEventListener('click', () => Interaction.selectService(svc.name));
+      g.appendChild(headerHit);
+
+      // Probes (skip ready — header IS the ready signal)
+      const visProbes = visibleProbes(svc);
+      for (let ci = 0; ci < visProbes.length; ci++) {
+        const probe = visProbes[ci];
+        const cy = HEADER_H + CARD_PAD + ci * PROBE_H;
+
+        // Probe dot
+        g.appendChild(svgEl('circle', { cx: 14, cy: cy + PROBE_H / 2, r: 3, fill: 'var(--gray)', 'data-dot': `probe:${svc.name}.${probe.name}` }));
+
+        // Probe name
+        g.appendChild(svgEl('text', { x: 26, y: cy + PROBE_H / 2 + 3, class: 'probe-text' })).textContent = probe.name;
+
+        // Cross-service dependency indicators (dots + labels if space allows)
+        const crossDeps = (probe.depends_on || []).filter(d => d.split('.')[0] !== svc.name);
+        if (crossDeps.length > 0) {
+          const nameWidth = probe.name.length * 7 + 30; // probe name + dot + padding
+          const available = p.w - nameWidth - 8;
+          // Compute total label width to decide if labels fit
+          const labels = crossDeps.map(d => { const [ds, dc] = d.split('.'); return dc === 'ready' ? ds : `${ds}.${dc}`; });
+          const totalLabelW = labels.reduce((s, l) => s + l.length * 5.5 + 12, 0);
+          const showLabels = totalLabelW < available;
+
+          let dx = p.w - 8;
+          for (let di = crossDeps.length - 1; di >= 0; di--) {
+            const dep = crossDeps[di];
+            if (showLabels) {
+              const labelW = labels[di].length * 5.5;
+              dx -= labelW + 2;
+              g.appendChild(svgEl('text', { x: dx, y: cy + PROBE_H / 2 + 3, class: 'probe-dep-label' })).textContent = labels[di];
+              dx -= 8;
+            }
+            g.appendChild(svgEl('circle', { cx: dx, cy: cy + PROBE_H / 2, r: 2.5, fill: '#4c566a', 'data-dot': `dep:${svc.name}.${probe.name}:${dep}` }));
+            dx -= 8;
+          }
+        }
+
+        // Click area
+        const hit = svgEl('rect', { x: 0, y: cy, width: p.w, height: PROBE_H, class: 'probe-hit' });
+        hit.addEventListener('click', () => Interaction.selectProbe(`${svc.name}.${probe.name}`));
+        g.appendChild(hit);
+      }
+
+
+      this.nodeGroup.appendChild(g);
+
+      // Intra-service dependency edges (behind card, in edge layer, skip ready)
+      const visProbeIdx = {};
+      for (let ci = 0; ci < visProbes.length; ci++) {
+        visProbeIdx[visProbes[ci].name] = ci;
+      }
+      for (let ci = 0; ci < visProbes.length; ci++) {
+        const probe = visProbes[ci];
+        for (const ref of (probe.depends_on || [])) {
+          const [depSvc, depProbe] = ref.split('.');
+          if (depSvc !== svc.name) continue;
+          const di = visProbeIdx[depProbe];
+          if (di === undefined) continue;
+          const fromY = p.y + HEADER_H + CARD_PAD + di * PROBE_H + PROBE_H / 2;
+          const toY = p.y + HEADER_H + CARD_PAD + ci * PROBE_H + PROBE_H / 2;
+          const fromX = p.x + p.w;
+          const toX = p.x;
+          const dx = Math.abs(fromX - toX) * 0.45;
+          this.edgeGroup.appendChild(svgEl('path', {
+            d: `M${fromX},${fromY} C${fromX + dx},${fromY} ${toX - dx},${toY} ${toX},${toY}`,
+            fill: 'none', stroke: '#4c566a', 'stroke-width': 1,
+            class: 'intra-arc',
+            'data-from': `${svc.name}.${depProbe}`,
+            'data-to': `${svc.name}.${probe.name}`,
+          }));
+        }
+      }
+      this.elements[`svc:${svc.name}`] = g;
+    }
+
+    // Draw target nodes (with depends_on target rows + probe rows)
+    for (const tgt of graph.targets) {
+      const p = positions[`target:${tgt.name}`];
+      const directProbes = p.directProbes || [];
+      const depTargets = p.dependsOn || [];
+      const g = svgEl('g', { class: 'target-card', 'data-target': tgt.name, transform: `translate(${p.x},${p.y})` });
+      g.addEventListener('contextmenu', (e) => { e.preventDefault(); ContextMenu.showTarget(e, tgt.name); });
+      g.addEventListener('click', (e) => { if (!e.target.closest('.probe-hit')) Interaction.selectTarget(tgt.name); });
+      g.style.cursor = 'pointer';
+
+      // Card background
+      g.appendChild(svgEl('rect', { width: p.w, height: p.h, rx: 6, ry: 6, fill: 'var(--card-bg)', stroke: 'var(--card-border)', 'stroke-width': 1, 'data-bg': `tgt:${tgt.name}` }));
+
+      // Header background
+      g.appendChild(svgEl('rect', { width: p.w, height: HEADER_H, rx: 6, ry: 6, fill: '#1e222a33' }));
+      g.appendChild(svgEl('rect', { y: HEADER_H - 6, width: p.w, height: 6, fill: '#1e222a33' }));
+
+      // Status dot + name
+      g.appendChild(svgEl('circle', { cx: 14, cy: HEADER_H / 2, r: 4, fill: 'var(--gray)', 'data-dot': `tgt:${tgt.name}` }));
+      g.appendChild(svgEl('text', { x: 26, y: HEADER_H / 2 + 4, class: 'svc-header-text' })).textContent = tgt.name;
+
+      // Header click area
+      const headerHit = svgEl('rect', { width: p.w, height: HEADER_H, fill: 'transparent', cursor: 'pointer' });
+      headerHit.addEventListener('click', () => Interaction.selectTarget(tgt.name));
+      g.appendChild(headerHit);
+
+      let rowIdx = 0;
+
+      // Depends-on target rows (with TGT badge)
+      for (const depName of depTargets) {
+        const cy = HEADER_H + CARD_PAD + rowIdx * PROBE_H;
+        g.appendChild(svgEl('circle', { cx: 14, cy: cy + PROBE_H / 2, r: 3, fill: 'var(--gray)', 'data-dot': `tgt-dep:${tgt.name}:${depName}` }));
+
+        // TGT badge
+        g.appendChild(svgEl('rect', { x: 24, y: cy + PROBE_H / 2 - 6, width: 22, height: 12, rx: 2, fill: 'var(--card-border)' }));
+        g.appendChild(svgEl('text', { x: 35, y: cy + PROBE_H / 2 + 3, class: 'target-badge', 'text-anchor': 'middle' })).textContent = 'TGT';
+
+        g.appendChild(svgEl('text', { x: 50, y: cy + PROBE_H / 2 + 3, class: 'probe-text' })).textContent = depName;
+
+        const hit = svgEl('rect', { x: 0, y: cy, width: p.w, height: PROBE_H, class: 'probe-hit' });
+        hit.addEventListener('click', () => Interaction.selectTarget(depName));
+        g.appendChild(hit);
+        rowIdx++;
+      }
+
+      // Direct probe rows
+      for (let ci = 0; ci < directProbes.length; ci++) {
+        const ref = directProbes[ci];
+        const cy = HEADER_H + CARD_PAD + rowIdx * PROBE_H;
+
+        g.appendChild(svgEl('circle', { cx: 14, cy: cy + PROBE_H / 2, r: 3, fill: 'var(--gray)', 'data-dot': `tgt-probe:${tgt.name}:${ref}` }));
+
+        // Short label: db.ready → db, db.port → db.port
+        const [rs, rc] = ref.split('.');
+        const refLabel = rc === 'ready' ? rs : ref;
+        g.appendChild(svgEl('text', { x: 26, y: cy + PROBE_H / 2 + 3, class: 'probe-text' })).textContent = refLabel;
+
+        const hit = svgEl('rect', { x: 0, y: cy, width: p.w, height: PROBE_H, class: 'probe-hit' });
+        hit.addEventListener('click', () => Interaction.selectProbe(ref));
+        g.appendChild(hit);
+        rowIdx++;
+      }
+
+      this.nodeGroup.appendChild(g);
+      this.elements[`tgt:${tgt.name}`] = g;
+    }
+
+    this.updateColors();
+    this.centerView(positions);
+  },
+
+  centerView(positions) {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const p of Object.values(positions)) {
+      minX = Math.min(minX, p.x);
+      minY = Math.min(minY, p.y);
+      maxX = Math.max(maxX, p.x + p.w);
+      maxY = Math.max(maxY, p.y + p.h);
+    }
+    const svg = document.getElementById('graph-svg');
+    const sw = svg.clientWidth;
+    const sh = svg.clientHeight;
+    const gw = maxX - minX + 80;
+    const gh = maxY - minY + 80;
+    const scale = Math.min(sw / gw, sh / gh, 1.2);
+    const cx = (minX + maxX) / 2;
+    const cy = (minY + maxY) / 2;
+    S.transform = { x: sw / 2 - cx * scale, y: sh / 2 - cy * scale, scale };
+    this.applyTransform();
+  },
+
+  applyTransform() {
+    const { x, y, scale } = S.transform;
+    this.root.setAttribute('transform', `translate(${x},${y}) scale(${scale})`);
+  },
+
+  updateColors() {
+    if (!S.graph) return;
+    const svg = document.getElementById('graph-svg');
+    const set = (sel, color) => { svg.querySelectorAll(sel).forEach(el => { el.style.fill = color; }); };
+    const setOne = (sel, fn) => { svg.querySelectorAll(sel).forEach(fn); };
+
+    for (const svc of S.graph.services) {
+      const bgState = svcBgState(svc);
+      set(`[data-bg="${svc.name}"]`, stateBgFill(bgState));
+
+      const rs = probeState(svc.name, 'ready');
+      setOne(`[data-dot="svc:${svc.name}"]`, el => {
+        el.style.fill = stateColor(rs);
+        el.classList.toggle('dot-stale-svg', rs === 'stale');
+      });
+
+      setOne(`[data-runtime="${svc.name}"]`, el => {
+        const ds = S.services[svc.name]?.state || 'stopped';
+        el.textContent = (ds === 'stopped') ? 'stopped' : '';
+      });
+
+      for (const probe of svc.probes) {
+        const cs = probeState(svc.name, probe.name);
+        setOne(`[data-dot="probe:${svc.name}.${probe.name}"]`, el => {
+          if (el._probeStart) return; // don't override probe flash
+          el.style.fill = stateColor(cs);
+          el.classList.toggle('dot-stale-svg', cs === 'stale');
+        });
+        for (const dep of (probe.depends_on || [])) {
+          const [ds, dc] = dep.split('.');
+          const dcs = probeState(ds, dc);
+          setOne(`[data-dot="dep:${svc.name}.${probe.name}:${dep}"]`, el => {
+            el.style.fill = depColor(dcs);
+            el.classList.toggle('dot-stale-svg', dcs === 'stale');
+          });
+        }
+      }
+    }
+    for (const tgt of S.graph.targets) {
+      const ts = targetState(tgt.name);
+      setOne(`[data-dot="tgt:${tgt.name}"]`, el => {
+        el.style.fill = stateColor(ts);
+        el.classList.toggle('dot-stale-svg', ts === 'stale');
+      });
+      set(`[data-bg="tgt:${tgt.name}"]`, stateBgFill(ts));
+      // Target dep/probe dots use depColor (dependency context: green or red)
+      for (const dep of (tgt.depends_on || [])) {
+        const ds = targetState(dep);
+        setOne(`[data-dot="tgt-dep:${tgt.name}:${dep}"]`, el => {
+          el.style.fill = depColor(ds);
+          el.classList.toggle('dot-stale-svg', ds === 'stale');
+        });
+      }
+      const p = S.layout?.[`target:${tgt.name}`];
+      if (p) {
+        for (const ref of (p.directProbes || [])) {
+          const [svc, probeName] = ref.split('.');
+          const tcs = probeState(svc, probeName);
+          setOne(`[data-dot="tgt-probe:${tgt.name}:${ref}"]`, el => {
+            el.style.fill = depColor(tcs);
+            el.classList.toggle('dot-stale-svg', tcs === 'stale');
+          });
+        }
+      }
+    }
+    // Color edges by source state + pulse if source green but dest not
+    document.querySelectorAll('#edges path, #fg path, #edges .intra-arc, #fg .intra-arc').forEach(edge => {
+      const from = edge.dataset.from;
+      const to = edge.dataset.to;
+      if (!from) return;
+
+      let srcState;
+      if (from.startsWith('target:')) {
+        srcState = targetState(from.slice(7));
+      } else {
+        const [s, c] = from.split('.');
+        srcState = (s && c) ? probeState(s, c) : 'stopped';
+      }
+
+      let destState = null;
+      if (to) {
+        if (to.startsWith('target:')) {
+          destState = targetState(to.slice(7));
+        } else if (to.includes('.')) {
+          const [ds, dc] = to.split('.');
+          if (ds && dc) destState = probeState(ds, dc);
+        } else {
+          // Service name (start_after dest)
+          destState = S.services[to]?.state || 'stopped';
+        }
+      }
+
+      // If dest is active (not stopped), stopped source = red (unsatisfied dependency)
+      const destActive = destState && destState !== 'stopped';
+      const effectiveSrc = (srcState === 'stopped' && destActive) ? 'red' : srcState;
+
+      edge.style.stroke = stateColor(effectiveSrc);
+      edge.classList.remove('edge-pulse', 'edge-flow');
+      if (effectiveSrc === 'green' && destState && destState !== 'green') {
+        edge.classList.add('edge-flow');
+      } else if (effectiveSrc === 'stale') {
+        edge.classList.add('edge-pulse');
+      }
+    });
+
+    Tree.updateColors();
+  }
+};
+
+// ══════════════════════════════════════════════════════════════════════
+// TREE (LEFT PANEL)
+// ══════════════════════════════════════════════════════════════════════
+const Tree = {
+  expanded: new Set(),
+
+  render() {
+    if (!S.graph) return;
+    const st = document.getElementById('service-tree');
+    const tt = document.getElementById('target-tree');
+    st.innerHTML = '';
+    tt.innerHTML = '';
+
+    for (const svc of S.graph.services) {
+      const node = document.createElement('div');
+      node.className = 'tree-node';
+      node.dataset.svc = svc.name;
+      const isOpen = this.expanded.has(svc.name);
+      node.innerHTML = `<span class="chevron ${isOpen ? 'open' : ''}">&#9654;</span><span class="dot dot-gray" data-tree-dot="svc:${svc.name}"></span><span class="label">${svc.name}</span><span class="runtime-label" data-runtime="${svc.name}"></span>`;
+      node.addEventListener('click', () => {
+        if (this.expanded.has(svc.name)) this.expanded.delete(svc.name);
+        else this.expanded.add(svc.name);
+        this.render();
+        Interaction.selectService(svc.name);
+      });
+      node.addEventListener('contextmenu', (e) => { e.preventDefault(); ContextMenu.showService(e, svc.name); });
+      st.appendChild(node);
+
+      const probesList = document.createElement('div');
+      probesList.className = `tree-probes ${isOpen ? '' : 'collapsed'}`;
+      for (const probe of svc.probes) {
+        if (probe.name === 'ready') continue;
+        const cn = document.createElement('div');
+        cn.className = 'tree-node probe-node';
+        cn.dataset.probe = `${svc.name}.${probe.name}`;
+        cn.innerHTML = `<span class="dot dot-gray" data-tree-dot="probe:${svc.name}.${probe.name}"></span><span class="label">${probe.name}</span>`;
+        cn.addEventListener('click', (e) => { e.stopPropagation(); Interaction.selectProbe(`${svc.name}.${probe.name}`); });
+        probesList.appendChild(cn);
+      }
+      st.appendChild(probesList);
+    }
+
+    // Build target map + compute direct probes (exclude inherited from depends_on targets)
+    const tgtMap = {};
+    for (const t of S.graph.targets) tgtMap[t.name] = t;
+
+    for (const tgt of S.graph.targets) {
+      const inheritedProbes = new Set();
+      for (const dep of (tgt.depends_on || [])) {
+        const dt = tgtMap[dep];
+        if (dt) for (const c of dt.probes) inheritedProbes.add(c);
+      }
+      const directProbes = tgt.probes.filter(c => !inheritedProbes.has(c));
+
+      const tgtKey = `tgt:${tgt.name}`;
+      const isOpen = this.expanded.has(tgtKey);
+      const hasChildren = directProbes.length > 0 || (tgt.depends_on || []).length > 0;
+
+      const node = document.createElement('div');
+      node.className = 'tree-node target-node';
+      node.dataset.target = tgt.name;
+      node.innerHTML = `${hasChildren ? `<span class="chevron ${isOpen ? 'open' : ''}">&#9654;</span>` : '<span style="width:12px;display:inline-block"></span>'}<span class="dot dot-gray" data-tree-dot="tgt:${tgt.name}"></span><span class="label">${tgt.name}</span>`;
+      node.addEventListener('click', () => {
+        if (hasChildren) {
+          if (this.expanded.has(tgtKey)) this.expanded.delete(tgtKey);
+          else this.expanded.add(tgtKey);
+          this.render();
+        }
+        Interaction.selectTarget(tgt.name);
+      });
+      node.addEventListener('contextmenu', (e) => { e.preventDefault(); ContextMenu.showTarget(e, tgt.name); });
+      tt.appendChild(node);
+
+      if (hasChildren) {
+        const children = document.createElement('div');
+        children.className = `tree-probes ${isOpen ? '' : 'collapsed'}`;
+
+        // Show depends_on targets
+        for (const dep of (tgt.depends_on || [])) {
+          const dn = document.createElement('div');
+          dn.className = 'tree-node probe-node target-node';
+          dn.dataset.target = dep;
+          dn.innerHTML = `<span class="dot dot-gray" data-tree-dot="tgt:${dep}"></span><span class="label">${dep}</span><span class="type-badge">TGT</span>`;
+          dn.addEventListener('click', (e) => { e.stopPropagation(); Interaction.selectTarget(dep); });
+          children.appendChild(dn);
+        }
+
+        // Show direct probes
+        for (const ref of directProbes) {
+          const cn = document.createElement('div');
+          cn.className = 'tree-node probe-node';
+          cn.dataset.probe = ref;
+          cn.innerHTML = `<span class="dot dot-gray" data-tree-dot="probe:${ref}"></span><span class="label">${ref}</span>`;
+          cn.addEventListener('click', (e) => { e.stopPropagation(); Interaction.selectProbe(ref); });
+          children.appendChild(cn);
+        }
+
+        tt.appendChild(children);
+      }
+    }
+
+    this.updateColors();
+  },
+
+  updateColors() {
+    if (!S.graph) return;
+    for (const svc of S.graph.services) {
+      // Service dot = ready probe state
+      document.querySelectorAll(`[data-tree-dot="svc:${svc.name}"]`).forEach(d => {
+        d.className = `dot ${stateDotClass(probeState(svc.name, 'ready'))}`;
+      });
+      // Runtime label (stopped/running/crashed)
+      document.querySelectorAll(`[data-runtime="${svc.name}"]`).forEach(el => {
+        const ds = S.services[svc.name]?.state || 'stopped';
+        const runtime = (ds === 'stopped') ? 'stopped' : '';
+        el.textContent = runtime;
+      });
+      for (const probe of svc.probes) {
+        document.querySelectorAll(`[data-tree-dot="probe:${svc.name}.${probe.name}"]`).forEach(d => {
+          d.className = `dot ${stateDotClass(probeState(svc.name, probe.name))}`;
+        });
+      }
+    }
+    for (const tgt of S.graph.targets) {
+      document.querySelectorAll(`[data-tree-dot="tgt:${tgt.name}"]`).forEach(d => {
+        d.className = `dot ${stateDotClass(targetState(tgt.name))}`;
+      });
+    }
+  },
+
+  syncSelection(sel, probeSet) {
+    document.querySelectorAll('#left-panel .tree-node.selected').forEach(n => n.classList.remove('selected'));
+    if (!sel) return;
+
+    if (probeSet) {
+      // Auto-expand involved services and targets, collapse the rest
+      const involvedSvcs = new Set();
+      for (const c of probeSet) involvedSvcs.add(c.split('.')[0]);
+      const involvedTgts = new Set();
+      if (S.graph) {
+        for (const tgt of S.graph.targets) {
+          if (tgt.probes.some(c => probeSet.has(c))) involvedTgts.add(`tgt:${tgt.name}`);
+        }
+      }
+
+      this.expanded = new Set([...involvedSvcs, ...involvedTgts]);
+      this.render();
+    }
+
+    let q;
+    if (sel.type === 'service') q = `.tree-node[data-svc="${sel.id}"]`;
+    else if (sel.type === 'probe') q = `.tree-node[data-probe="${sel.id}"]`;
+    else if (sel.type === 'target') q = `.tree-node[data-target="${sel.id}"]`;
+    if (q) {
+      const el = document.querySelector(q);
+      if (el) {
+        el.classList.add('selected');
+        el.scrollIntoView({ block: 'nearest' });
+      }
+    }
+  }
+};
+
+// ══════════════════════════════════════════════════════════════════════
+// EVENTS (RIGHT PANEL)
+// ══════════════════════════════════════════════════════════════════════
+const Events = {
+  append(ev) {
+    S.events.push(ev);
+    if (S.events.length > MAX_EVENTS) S.events.shift();
+
+    const list = document.getElementById('event-list');
+    const row = this.createRow(ev);
+    list.appendChild(row);
+
+    // Prune DOM
+    while (list.children.length > MAX_EVENTS * 2) {
+      list.removeChild(list.firstChild);
+    }
+
+    this.applyFilter(row);
+
+    if (S.autoScroll) {
+      list.scrollTop = list.scrollHeight;
+    } else {
+      document.getElementById('new-events-btn').style.display = 'block';
+    }
+  },
+
+  createRow(ev) {
+    const frag = document.createDocumentFragment();
+    const row = document.createElement('div');
+    row.className = 'event-row';
+    row.dataset.category = ev.category;
+    row.dataset.level = ev.level || 'info';
+
+    const ts = new Date(ev.ts).toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    const badgeLabel = { service: 'SVC', probe_state: 'PRB', probe: 'ATT', target: 'TGT', op: 'CMD', restart: 'ACT', message: 'MSG' }[ev.category] || ev.category;
+    row.dataset.searchtext = `${ts} ${badgeLabel} ${ev.category} ${ev.entity || ''} ${ev.summary || ''}`.toLowerCase();
+    const hasDetail = ev.detail && ev.detail.length > 0;
+    const evState = ev.data?.display_state || ev.data?.state || '';
+    const dotColor = { green: 'var(--green)', red: 'var(--red)', stale: 'var(--gray)', stopped: 'var(--gray)' }[evState] || '';
+    const dotCls = (ev.category === 'target' || ev.category === 'service') ? 'event-dot-lg' : 'event-dot';
+    const isOp = ev.category === 'op';
+    const isProbeAttempt = ev.category === 'probe';
+    const isOk = isOp && ev.data?.result === 'ok';
+    const isProbeOk = isProbeAttempt && ev.data?.result === 'ok';
+    const isFail = (isOp && ev.data?.result === 'failed') || (isProbeAttempt && ev.data?.result === 'fail');
+    // Indicator: dots for state events, icons for operations/actions/attempts
+    const icoStyle = 'width:8px;flex-shrink:0;font-size:10px;text-align:center';
+    let indicator;
+    if (ev.category === 'message') {
+      indicator = `<span style="${icoStyle};color:#88c0d0">ℹ</span>`;
+    } else if (ev.category === 'restart') {
+      // ACT: gantry action (restart decision)
+      indicator = `<span style="${icoStyle};color:#d08770">↻</span>`;
+    } else if (isOk) {
+      // CMD complete ok
+      indicator = `<span class="event-ok" style="${icoStyle}">✓</span>`;
+    } else if (isFail) {
+      // CMD complete fail
+      indicator = `<span class="event-fail" style="${icoStyle}">✗</span>`;
+    } else if (isOp) {
+      // CMD start
+      indicator = `<span style="${icoStyle};color:var(--text-dim)">▶</span>`;
+    } else if (isProbeOk) {
+      // ATT ok
+      indicator = `<span class="event-ok" style="${icoStyle}">✓</span>`;
+    } else if (isProbeAttempt) {
+      // ATT fail
+      indicator = `<span class="event-fail" style="${icoStyle}">✗</span>`;
+    } else if (dotColor) {
+      // SVC/TGT/PRB: colored dot
+      indicator = `<span class="${dotCls}" style="background:${dotColor}"></span>`;
+    } else {
+      indicator = '<span class="event-dot-spacer"></span>';
+    }
+    row.innerHTML = `<span class="ts">${ts}</span><span class="badge badge-${ev.category}">${badgeLabel}</span>${indicator}<span class="summary">${escHtml(ev.summary)}</span>${hasDetail ? '<span class="expand-btn">+</span>' : ''}`;
+
+    // Click event row to highlight related entity in graph + flash node
+    row.addEventListener('click', () => {
+      const entity = ev.entity;
+      if (!entity) return;
+      const svcName = entity.includes('.') ? entity.split('.')[0] : entity;
+      if (entity.includes('.')) {
+        Interaction.selectProbe(entity);
+      } else if (S.graph?.targets?.find(t => t.name === entity)) {
+        Interaction.selectTarget(entity);
+      } else if (S.graph?.services?.find(s => s.name === entity)) {
+        Interaction.selectService(entity);
+      }
+      // Flash the node card — temporary bright stroke that fades
+      const svg = document.getElementById('graph-svg');
+      const sel = S.graph?.targets?.find(t => t.name === entity)
+        ? `[data-target="${entity}"]`
+        : `[data-svc="${svcName}"]`;
+      svg.querySelectorAll(sel).forEach(g => {
+        const bg = g.querySelector('[data-bg]');
+        if (!bg) return;
+        bg.style.stroke = '#a0a8b8';
+        bg.style.transition = 'stroke 1.5s';
+        setTimeout(() => {
+          bg.style.stroke = '';
+          setTimeout(() => bg.style.transition = '', 1500);
+        }, 100);
+      });
+    });
+
+    if (hasDetail) {
+      const detail = document.createElement('div');
+      detail.className = 'event-detail';
+      detail.textContent = ev.detail.join('\n');
+      row.querySelector('.expand-btn').addEventListener('click', (e) => {
+        e.stopPropagation();
+        detail.classList.toggle('open');
+        e.target.textContent = detail.classList.contains('open') ? '-' : '+';
+      });
+      const wrapper = document.createElement('div');
+      wrapper.appendChild(row);
+      wrapper.appendChild(detail);
+      return wrapper;
+    }
+    return row;
+  },
+
+  applyFilter(el) {
+    const verbose = document.getElementById('event-verbose').checked;
+    const search = document.getElementById('event-search').value.toLowerCase();
+    const rows = el ? [el] : document.querySelectorAll('#event-list > *');
+    for (const r of rows) {
+      const row = r.querySelector?.('.event-row') || r;
+      if (!row.dataset) continue;
+      const levelMatch = verbose || row.dataset.level !== 'debug';
+      const searchMatch = !search || (row.dataset.searchtext || '').includes(search);
+      const parent = row.closest('#event-list > *') || row;
+      parent.style.display = levelMatch && searchMatch ? '' : 'none';
+    }
+  },
+
+  applyFilterAll() {
+    this.applyFilter(null);
+  }
+};
+
+function escHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// INTERACTION (highlighting, zoom, pan)
+// ══════════════════════════════════════════════════════════════════════
+const Interaction = {
+  // Dependency indexes
+  depForward: {},  // probe -> [probes it depends_on]
+  depReverse: {},  // probe -> [probes that depend on it]
+
+  buildIndex(graph) {
+    this.depForward = {};
+    this.depReverse = {};
+    for (const svc of graph.services) {
+      for (const probe of svc.probes) {
+        const key = `${svc.name}.${probe.name}`;
+        this.depForward[key] = (probe.depends_on || []).slice();
+        for (const dep of (probe.depends_on || [])) {
+          (this.depReverse[dep] = this.depReverse[dep] || []).push(key);
+        }
+      }
+    }
+  },
+
+  walkUp(probeId, visited) {
+    if (visited.has(probeId)) return;
+    visited.add(probeId);
+    for (const dep of (this.depForward[probeId] || [])) this.walkUp(dep, visited);
+  },
+
+  walkDown(probeId, visited) {
+    if (visited.has(probeId)) return;
+    visited.add(probeId);
+    for (const dep of (this.depReverse[probeId] || [])) this.walkDown(dep, visited);
+  },
+
+  collectChain(seeds) {
+    const up = new Set();
+    const down = new Set();
+    for (const s of seeds) this.walkUp(s, up);
+    for (const s of seeds) this.walkDown(s, down);
+    return new Set([...up, ...down]);
+  },
+
+  selectProbe(probeId) {
+    S.selection = { type: 'probe', id: probeId };
+    const chain = this.collectChain([probeId]);
+    this.highlight(chain, new Set([probeId]));
+    Tree.syncSelection(S.selection, chain);
+  },
+
+  selectService(svcName) {
+    S.selection = { type: 'service', id: svcName };
+    const svc = S.graph?.services.find(s => s.name === svcName);
+    if (!svc) return;
+    const ownProbes = new Set(svc.probes.map(c => `${svcName}.${c.name}`));
+    const chain = this.collectChain([...ownProbes]);
+    this.highlight(chain, ownProbes);
+    Tree.syncSelection(S.selection, chain);
+  },
+
+  selectTarget(tgtName) {
+    S.selection = { type: 'target', id: tgtName };
+    const tgt = S.graph?.targets.find(t => t.name === tgtName);
+    if (!tgt) return;
+    const chain = new Set();
+    for (const s of tgt.probes) this.walkUp(s, chain);
+    this.highlight(chain, chain);
+    Tree.syncSelection(S.selection, chain);
+  },
+
+  clearSelection() {
+    S.selection = null;
+    document.querySelectorAll('#graph-root *[data-svc], #graph-root *[data-target]').forEach(el => el.style.opacity = '');
+    // Clear selection indicator
+    document.querySelectorAll('[data-bg]').forEach(el => { el.style.stroke = ''; });
+    // Move all edges back to edge layer
+    document.querySelectorAll('#fg path, #fg .intra-arc').forEach(el => {
+      Graph.edgeGroup.appendChild(el);
+    });
+    document.querySelectorAll('#edges path, .intra-arc').forEach(el => el.style.opacity = '');
+    Tree.syncSelection(null);
+  },
+
+  highlight(probeSet, targetMatchProbes) {
+    // Determine which services are involved
+    const involvedSvcs = new Set();
+    for (const c of probeSet) involvedSvcs.add(c.split('.')[0]);
+
+    // Determine which targets reference any of the targetMatchProbes
+    const involvedTgts = new Set();
+    for (const tgt of S.graph.targets) {
+      if (tgt.probes.some(c => targetMatchProbes.has(c))) involvedTgts.add(tgt.name);
+    }
+
+    // Clear previous selection indicator
+    document.querySelectorAll('[data-bg]').forEach(el => { el.style.stroke = ''; });
+
+    // Subtle selection indicator — light border on selected node
+    if (S.selection) {
+      const selKey = S.selection.type === 'target' ? `tgt:${S.selection.id}` :
+        S.selection.type === 'service' ? S.selection.id :
+        S.selection.id.split('.')[0]; // probe → service
+      const bg = document.querySelector(`[data-bg="${selKey}"]`) ||
+        document.querySelector(`[data-bg="tgt:${S.selection.id}"]`);
+      if (bg) { bg.style.stroke = '#8890a0'; }
+    }
+
+    // Dim all nodes
+    for (const svc of S.graph.services) {
+      const el = Graph.elements[`svc:${svc.name}`];
+      if (el) el.style.opacity = involvedSvcs.has(svc.name) ? '1' : String(0.15);
+    }
+    for (const tgt of S.graph.targets) {
+      const el = Graph.elements[`tgt:${tgt.name}`];
+      if (el) el.style.opacity = involvedTgts.has(tgt.name) ? '1' : String(0.15);
+    }
+
+    // Dim/highlight edges (search both bg and fg groups)
+    document.querySelectorAll('#edges path, #fg path').forEach(path => {
+      const from = path.dataset.from;
+      const to = path.dataset.to;
+      const type = path.dataset.type;
+      let show = false;
+      if (type === 'start_after') {
+        show = probeSet.has(from) && involvedSvcs.has(to);
+      } else if (type === 'depends_on') {
+        show = probeSet.has(from) && probeSet.has(to);
+      } else if (type === 'target') {
+        show = probeSet.has(from) && involvedTgts.has(to.replace('target:', ''));
+      } else if (type === 'target-dep') {
+        show = involvedTgts.has(from.replace('target:', '')) && involvedTgts.has(to.replace('target:', ''));
+      }
+      path.style.opacity = show ? '0.9' : String(0.06);
+      path.style.strokeWidth = '';
+      if (show) { Graph.fgGroup.appendChild(path); }
+      else { Graph.edgeGroup.appendChild(path); }
+    });
+
+    // Highlight intra-service arcs (may be in #edges or #fg)
+    document.querySelectorAll('#edges .intra-arc, #fg .intra-arc').forEach(arc => {
+      const from = arc.dataset.from;
+      const to = arc.dataset.to;
+      const show = probeSet.has(from) && probeSet.has(to);
+      arc.style.opacity = show ? '0.9' : '';
+      if (show) { Graph.fgGroup.appendChild(arc); }
+      else { Graph.edgeGroup.appendChild(arc); }
+    });
+  },
+
+  initZoomPan() {
+    const svg = document.getElementById('graph-svg');
+    let dragging = false;
+    let dragStart = { x: 0, y: 0 };
+
+    svg.addEventListener('wheel', (e) => {
+      if (!e.ctrlKey && !e.metaKey) return;
+      e.preventDefault();
+      const rect = svg.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+      const oldScale = S.transform.scale;
+      const factor = e.deltaY < 0 ? 1.08 : 0.93;
+      const newScale = Math.max(0.3, Math.min(3, oldScale * factor));
+      // Zoom toward cursor
+      S.transform.x = mx - (mx - S.transform.x) * (newScale / oldScale);
+      S.transform.y = my - (my - S.transform.y) * (newScale / oldScale);
+      S.transform.scale = newScale;
+      Graph.applyTransform();
+    }, { passive: false });
+
+    svg.addEventListener('mousedown', (e) => {
+      if (e.target === svg || e.target.id === 'graph-root' || e.target.tagName === 'svg') {
+        dragging = true;
+        dragStart = { x: e.clientX - S.transform.x, y: e.clientY - S.transform.y };
+      }
+    });
+    window.addEventListener('mousemove', (e) => {
+      if (!dragging) return;
+      S.transform.x = e.clientX - dragStart.x;
+      S.transform.y = e.clientY - dragStart.y;
+      Graph.applyTransform();
+    });
+    window.addEventListener('mouseup', () => { dragging = false; });
+
+    // Click empty to clear
+    svg.addEventListener('click', (e) => {
+      if (e.target === svg || e.target.id === 'graph-root') {
+        Interaction.clearSelection();
+      }
+    });
+
+    // Right-click empty space — global context menu
+    // Check that the click is not on a service/target card
+    svg.addEventListener('contextmenu', (e) => {
+      if (e.target.closest('.svc-card') || e.target.closest('.target-card')) return;
+      e.preventDefault();
+      const targets = S.graph?.targets || [];
+      const items = targets.map(t => ({
+        label: `Converge ${t.name}`,
+        action: () => API.convergeTarget(t.name),
+      }));
+      if (items.length > 0) items.push({ sep: true });
+      items.push({
+        label: 'Reprobe All',
+        action: () => API.run('reprobe', 'all', '/reprobe/all', { timeout: 60 }),
+      });
+      ContextMenu.show(e.clientX, e.clientY, items);
+    });
+  }
+};
+
+// ══════════════════════════════════════════════════════════════════════
+// CONTEXT MENU
+// ══════════════════════════════════════════════════════════════════════
+const ContextMenu = {
+  el: document.getElementById('context-menu'),
+
+  showService(e, name) {
+    const items = [
+      { label: 'Start', action: () => API.startService(name) },
+      { label: 'Stop', action: () => API.stopService(name) },
+      { label: 'Restart', action: () => API.restartService(name) },
+      { sep: true },
+      { label: 'Reprobe', action: () => API.reprobeService(name) },
+    ];
+    this.show(e.clientX, e.clientY, items);
+  },
+
+  showTarget(e, name) {
+    const items = [
+      { label: 'Converge', action: () => API.convergeTarget(name) },
+      { label: 'Reprobe', action: () => API.reprobeTarget(name) },
+    ];
+    this.show(e.clientX, e.clientY, items);
+  },
+
+  show(x, y, items) {
+    this.el.innerHTML = '';
+    for (const item of items) {
+      if (item.sep) {
+        this.el.appendChild(Object.assign(document.createElement('div'), { className: 'menu-sep' }));
+        continue;
+      }
+      const d = document.createElement('div');
+      d.className = 'menu-item';
+      d.textContent = item.label;
+      d.addEventListener('click', (e) => { e.stopPropagation(); this.hide(); item.action(); });
+      this.el.appendChild(d);
+    }
+    this.el.style.left = x + 'px';
+    this.el.style.top = y + 'px';
+    this.el.style.display = 'block';
+  },
+
+  hide() {
+    this.el.style.display = 'none';
+  }
+};
+
+document.addEventListener('click', () => ContextMenu.hide());
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { ContextMenu.hide(); Interaction.clearSelection(); }});
+
+// ══════════════════════════════════════════════════════════════════════
+// API
+// ══════════════════════════════════════════════════════════════════════
+const API = {
+  async post(path, params = {}) {
+    const sep = path.includes('?') ? '&' : '?';
+    const query = params.timeout ? `${sep}timeout=${params.timeout}` : '';
+    try {
+      const resp = await fetch(`/api${path}${query}`, { method: 'POST' });
+      return await resp.json();
+    } catch (e) {
+      console.error('API error:', e);
+      return { result: 'error', error: String(e) };
+    }
+  },
+
+  async run(op, entity, path, params) {
+    Toast.show(`${op} ${entity}...`, 'pending');
+    const result = await this.post(path, params);
+    if (result?.result === 'ok') {
+      Toast.show(`${op} ${entity}: ok${result.duration_ms ? ` (${result.duration_ms}ms)` : ''}`, 'ok');
+    } else {
+      Toast.show(`${op} ${entity}: ${result?.error || result?.result || 'failed'}`, 'fail');
+    }
+    return result;
+  },
+
+  startService(n)   { return this.run('start', n, `/start/service/${n}`, { timeout: 120 }); },
+  stopService(n)    { return this.run('stop', n, `/stop/service/${n}`, {}); },
+  restartService(n) { return this.run('restart', n, `/restart/service/${n}`, { timeout: 120 }); },
+  replaceService(n) { return this.run('replace', n, `/replace/service/${n}`, { timeout: 120 }); },
+  reprobeService(n) { return this.run('reprobe', n, `/reprobe/service/${n}`, { timeout: 60 }); },
+  convergeTarget(n) { return this.run('converge', n, `/converge/target/${n}`, { timeout: 120 }); },
+  reprobeTarget(n)  { return this.run('reprobe', n, `/reprobe/target/${n}`, { timeout: 60 }); },
+};
+
+const Toast = {
+  el: null,
+  timer: null,
+  init() {
+    this.el = document.createElement('div');
+    this.el.id = 'toast';
+    document.getElementById('app').appendChild(this.el);
+  },
+  show(msg, type) {
+    if (!this.el) this.init();
+    this.el.textContent = msg;
+    this.el.className = `toast-${type}`;
+    this.el.style.display = 'block';
+    this.el.style.opacity = '1';
+    clearTimeout(this.timer);
+    if (type !== 'pending') {
+      this.timer = setTimeout(() => {
+        this.el.style.opacity = '0';
+        setTimeout(() => { this.el.style.display = 'none'; }, 300);
+      }, 3000);
+    }
+  }
+};
+
+// ══════════════════════════════════════════════════════════════════════
+// WEBSOCKET
+// ══════════════════════════════════════════════════════════════════════
+const WS = {
+  ws: null,
+
+  connect() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const url = `${proto}//${location.host}/api/ws`;
+    this.ws = new WebSocket(url);
+
+    this.ws.onopen = () => {
+      S.wsRetryDelay = 1000;
+      document.getElementById('ws-status').textContent = 'connected';
+      document.getElementById('ws-status').className = 'connected';
+    };
+
+    this.ws.onmessage = (e) => {
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'snapshot') {
+          this.handleSnapshot(msg);
+        } else {
+          this.handleEvent(msg);
+        }
+      } catch (err) {
+        console.error('WS parse error:', err);
+      }
+    };
+
+    this.ws.onclose = () => {
+      document.getElementById('ws-status').textContent = 'disconnected';
+      document.getElementById('ws-status').className = 'disconnected';
+      setTimeout(() => this.connect(), S.wsRetryDelay);
+      S.wsRetryDelay = Math.min(S.wsRetryDelay * 2, 30000);
+    };
+
+    this.ws.onerror = () => { this.ws.close(); };
+  },
+
+  handleSnapshot(msg) {
+    // Merge service states
+    for (const [name, data] of Object.entries(msg.services || {})) {
+      S.services[name] = { state: data.state, probes: {} };
+      for (const [probeName, cdata] of Object.entries(data.probes || {})) {
+        S.services[name].probes[probeName] = { state: cdata.state };
+      }
+    }
+    // Merge target states
+    for (const [name, data] of Object.entries(msg.targets || {})) {
+      S.targets[name] = { state: data.state };
+    }
+    Graph.updateColors();
+  },
+
+  handleEvent(ev) {
+    // Update state
+    if (ev.category === 'service' && ev.data) {
+      const svc = ev.data.service;
+      if (svc && S.services[svc]) S.services[svc].state = ev.data.display_state || ev.data.state;
+    } else if (ev.category === 'probe_state' && ev.data) {
+      const parts = ev.data.probe?.split('.');
+      if (parts?.length === 2 && S.services[parts[0]]) {
+        if (!S.services[parts[0]].probes[parts[1]]) {
+          S.services[parts[0]].probes[parts[1]] = {};
+        }
+        S.services[parts[0]].probes[parts[1]].state = ev.data.display_state || ev.data.state;
+      }
+    } else if (ev.category === 'target' && ev.data) {
+      const tgt = ev.data.target;
+      if (tgt) S.targets[tgt] = { state: ev.data.state };
+    }
+
+    // Probe activity: probe event with attempt=0 means "probe started", flash that probe's dot
+    if (ev.category === 'probe' && ev.data?.attempt === 0 && ev.entity) {
+      const svg = document.getElementById('graph-svg');
+      svg.querySelectorAll(`[data-dot="probe:${ev.entity}"]`).forEach(dot => {
+        dot.style.fill = '#e5e9f0';
+        dot.style.animation = 'dotProbing 0.5s ease-in-out infinite';
+        dot._probeStart = Date.now();
+      });
+    }
+    // Probe state event = probe finished
+    if (ev.category === 'probe_state' && ev.data?.probe) {
+      const svg = document.getElementById('graph-svg');
+      svg.querySelectorAll(`[data-dot="probe:${ev.data.probe}"]`).forEach(dot => {
+        if (!dot._probeStart) return;
+        const elapsed = Date.now() - dot._probeStart;
+        const remaining = Math.max(0, 300 - elapsed);
+        setTimeout(() => {
+          dot.style.animation = '';
+          dot.style.fill = '';
+          delete dot._probeStart;
+          Graph.updateColors();
+        }, remaining);
+      });
+    }
+
+    try {
+      Graph.updateColors();
+    } catch(e) {
+      console.error('updateColors error:', e);
+    }
+    Events.append(ev);
+
+  }
+};
+
+// ══════════════════════════════════════════════════════════════════════
+// EVENT PANEL SETUP
+// ══════════════════════════════════════════════════════════════════════
+document.getElementById('event-verbose').addEventListener('change', () => Events.applyFilterAll());
+function toggleLeft() {
+  document.getElementById('left-panel').classList.toggle('collapsed');
+  updateGridColumns();
+}
+function toggleRight() {
+  document.getElementById('right-panel').classList.toggle('collapsed');
+  updateGridColumns();
+}
+document.getElementById('left-collapse').addEventListener('click', toggleLeft);
+document.getElementById('left-close').addEventListener('click', toggleLeft);
+document.getElementById('event-collapse').addEventListener('click', toggleRight);
+document.getElementById('right-close').addEventListener('click', toggleRight);
+function updateGridColumns() {
+  const lc = document.getElementById('left-panel').classList.contains('collapsed');
+  const rc = document.getElementById('right-panel').classList.contains('collapsed');
+  document.getElementById('app').style.gridTemplateColumns =
+    `${lc ? '0px' : '240px'} 1fr ${rc ? '0px' : '380px'}`;
+}
+document.getElementById('event-clear').addEventListener('click', () => {
+  document.getElementById('event-list').innerHTML = '';
+  S.events = [];
+});
+document.getElementById('event-search').addEventListener('input', () => Events.applyFilterAll());
+
+const eventList = document.getElementById('event-list');
+eventList.addEventListener('scroll', () => {
+  const atBottom = eventList.scrollTop + eventList.clientHeight >= eventList.scrollHeight - 10;
+  S.autoScroll = atBottom;
+  if (atBottom) document.getElementById('new-events-btn').style.display = 'none';
+});
+document.getElementById('new-events-btn').addEventListener('click', () => {
+  eventList.scrollTop = eventList.scrollHeight;
+  S.autoScroll = true;
+  document.getElementById('new-events-btn').style.display = 'none';
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// INIT
+// ══════════════════════════════════════════════════════════════════════
+async function loadELK() {
+  return new Promise((resolve, reject) => {
+    if (typeof ELK !== 'undefined') { resolve(); return; }
+    const s = document.createElement('script');
+    s.src = '/ui/elk.bundled.js';
+    s.onload = resolve;
+    s.onerror = () => reject(new Error('failed to load ELK.js layout engine'));
+    document.head.appendChild(s);
+  });
+}
+
+async function init() {
+  Interaction.initZoomPan();
+  WS.connect();
+
+  try {
+    await loadELK();
+    const resp = await fetch('/api/graph');
+    const graph = await resp.json();
+    S.graph = graph;
+
+    // Set initial state from graph — DON'T overwrite if WS snapshot already set it
+    for (const svc of graph.services) {
+      if (!S.services[svc.name]) {
+        S.services[svc.name] = { state: svc.state, probes: {} };
+      }
+      for (const probe of svc.probes) {
+        if (!S.services[svc.name].probes[probe.name]) {
+          S.services[svc.name].probes[probe.name] = { state: probe.state };
+        }
+      }
+    }
+    for (const tgt of graph.targets) {
+      if (!S.targets[tgt.name]) {
+        S.targets[tgt.name] = { state: tgt.state };
+      }
+    }
+
+    const positions = await Layout.compute(graph);
+    S.layout = positions;
+    Interaction.buildIndex(graph);
+    Graph.render(graph, positions);
+    Tree.render();
+
+    document.getElementById('loading').style.display = 'none';
+  } catch (e) {
+    document.getElementById('loading').innerHTML = `<span style="color:var(--red)">failed to load graph: ${escHtml(String(e))}</span>`;
+  }
+}
+
+init();
+</script>
+</body>
+</html>

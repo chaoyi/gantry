@@ -1,0 +1,49 @@
+# Demo: 6 services testing 4 converge recovery behaviors
+#
+# Infrastructure: postgres, redis
+# crash-svc:  exits when redis goes down (restart_on_fail: true)
+# stuck-svc:  stays running but broken when postgres goes down (restart_on_fail: true)
+# slow-heal:  reconnects to redis but takes ~20s (restart_on_fail: true — restart is faster)
+# fast-heal:  reconnects to postgres in ~2s (restart_on_fail: false)
+
+services:
+  gantry:
+    image: ghcr.io/chaoyi/gantry:latest
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    container_name: demo-gantry
+    environment:
+      RUST_LOG: gantry=debug
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./gantry.yaml:/etc/gantry/config.yaml:ro
+    ports:
+      - "9090:9090"
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: demo-postgres
+    environment:
+      POSTGRES_PASSWORD: testpass
+      POSTGRES_DB: testdb
+
+  redis:
+    image: redis:7-alpine
+    container_name: demo-redis
+
+  crash-svc:
+    build: ./crash-svc
+    container_name: demo-crash-svc
+
+  stuck-svc:
+    build: ./stuck-svc
+    container_name: demo-stuck-svc
+
+  slow-heal:
+    build: ./slow-heal
+    container_name: demo-slow-heal
+
+  fast-heal:
+    build: ./fast-heal
+    container_name: demo-fast-heal

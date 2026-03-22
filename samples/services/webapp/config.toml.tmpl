@@ -1,0 +1,8 @@
+[server]
+port = {{ port }}
+log_level = "{{ log_level }}"
+
+{% if redis_url %}
+[cache]
+url = "{{ redis_url }}"
+{% endif %}
