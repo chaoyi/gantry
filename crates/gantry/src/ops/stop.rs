@@ -42,6 +42,7 @@ pub async fn stop(state: &AppState, service_name: &str) -> Result<OpResponse> {
         let svc = services.get_mut(service_name).unwrap();
         container_name = svc.container.clone();
         svc.state = ServiceState::Stopped;
+        svc.generation += 1;
         svc.last_emitted_display = Some(crate::model::SvcDisplayState::Stopped);
         state.events.emit(Event::service_state(
             service_name,
@@ -54,14 +55,15 @@ pub async fn stop(state: &AppState, service_name: &str) -> Result<OpResponse> {
         for probe_name in &probe_names {
             let probe_ref = ProbeRef::new(service_name, probe_name);
             let probe = svc.probes.get_mut(probe_name).unwrap();
-            let prev = probe.state;
-            probe.prev_state = Some(prev);
-            probe.state = ProbeState::Red;
-            if prev != ProbeState::Red {
+            let prev = probe.state.clone();
+            probe.prev_color = Some(prev.color());
+            let new_state = ProbeState::Red(crate::model::RedReason::Stopped);
+            probe.state = new_state.clone();
+            if !prev.is_red() {
                 state.events.emit(Event::probe_state_change(
                     &probe_ref,
-                    ProbeState::Red,
-                    prev,
+                    new_state,
+                    prev.clone(),
                     "stopped",
                 ));
             }
@@ -70,6 +72,7 @@ pub async fn stop(state: &AppState, service_name: &str) -> Result<OpResponse> {
                 ProbeStatus {
                     state: "stopped".into(),
                     prev: prev.as_str().into(),
+                    reason: Some("stopped".into()),
                     probe_ms: None,
                     error: None,
                     logs: None,

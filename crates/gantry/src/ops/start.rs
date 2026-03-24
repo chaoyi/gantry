@@ -7,7 +7,15 @@ use crate::events::Event;
 use crate::model::{ProbeRef, ServiceState};
 use crate::ops::{OpActions, OpResponse, ProbeStatus, emit_target_states, resolve_probe_batch};
 
-pub async fn start(state: &AppState, service_name: &str, timeout: Duration) -> Result<OpResponse> {
+/// Start a service. If `check_start_after` is true (API calls), validates that
+/// start_after deps are Green before starting. Converge passes false (it manages
+/// ordering itself).
+pub async fn start(
+    state: &AppState,
+    service_name: &str,
+    timeout: Duration,
+    check_start_after: bool,
+) -> Result<OpResponse> {
     let start_time = Instant::now();
     let mut actions = OpActions::default();
     let mut probe_statuses: indexmap::IndexMap<String, ProbeStatus> = indexmap::IndexMap::new();
@@ -30,6 +38,36 @@ pub async fn start(state: &AppState, service_name: &str, timeout: Duration) -> R
                 targets: target_statuses,
             });
         }
+        // Check start_after deps (API calls only; converge skips this)
+        if check_start_after && !svc.start_after.is_empty() {
+            let mut unmet: Vec<String> = Vec::new();
+            for dep in &svc.start_after {
+                let dep_green = services
+                    .get(&dep.service)
+                    .and_then(|s| s.probes.get(&dep.probe))
+                    .is_some_and(|p| p.state.is_green());
+                if !dep_green {
+                    let dep_state_str = services
+                        .get(&dep.service)
+                        .and_then(|s| s.probes.get(&dep.probe))
+                        .map(|p| p.state.as_str())
+                        .unwrap_or("missing");
+                    let suggestion = match dep_state_str {
+                        "red" => format!("check {}", dep.service),
+                        "stale" => format!("reprobe {}", dep.service),
+                        _ => format!("start {}", dep.service),
+                    };
+                    unmet.push(format!("{dep}: {dep_state_str} ({suggestion})"));
+                }
+            }
+            if !unmet.is_empty() {
+                return Err(GantryError::Operation(format!(
+                    "start_after not satisfied: {}. Use converge to resolve all dependencies",
+                    unmet.join(", ")
+                )));
+            }
+        }
+
         container_name = svc.container.clone();
     }
 
@@ -50,6 +88,7 @@ pub async fn start(state: &AppState, service_name: &str, timeout: Duration) -> R
         let mut services = state.services.write().await;
         let svc = services.get_mut(service_name).unwrap();
         svc.state = ServiceState::Running;
+        svc.generation += 1;
         svc.log_since = log_since;
         state.events.emit(Event::service_state(
             service_name,

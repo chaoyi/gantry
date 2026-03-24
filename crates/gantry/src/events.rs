@@ -208,7 +208,7 @@ impl Event {
         match self {
             Self::ProbeResult { .. }
             | Self::ProbeStateChange {
-                state: ProbeState::Stale,
+                state: ProbeState::Stale(_),
                 ..
             } => "debug",
             _ => "info",
@@ -282,9 +282,8 @@ impl Event {
             } => {
                 let s = match state {
                     TargetState::Green => "ok",
-                    TargetState::Red => "failed",
-                    TargetState::Stale => "stale",
-                    TargetState::Stopped => "stopped",
+                    TargetState::Red(_) => "failed",
+                    TargetState::Stale { .. } => "stale",
                 };
                 let dur = duration_ms
                     .filter(|d| *d > 0)
@@ -331,6 +330,7 @@ impl Event {
                 lines.extend(matched_lines.iter().cloned());
                 lines
             }
+            Self::ProbeStateChange { state, .. } => state.reason().into_iter().collect(),
             Self::ServiceRestart { reason, .. } => vec![reason.clone()],
             _ => Vec::new(),
         }
@@ -358,6 +358,7 @@ impl Event {
                 "state": state.as_str(),
                 "prev": prev.as_str(),
                 "display_state": display_state,
+                "reason": state.reason(),
             }),
             Self::ProbeResult {
                 probe,
@@ -379,6 +380,7 @@ impl Event {
                 "target": target,
                 "state": state.as_str(),
                 "duration_ms": duration_ms,
+                "reason": state.reason(),
             }),
             Self::OpStart {
                 op,
@@ -464,15 +466,14 @@ impl EventBus {
                 tracing::info!("[{service}] restart: {reason}");
             }
             Event::ProbeStateChange { probe, state, .. } => match state {
-                ProbeState::Stale => tracing::debug!("[{probe}] stale"),
+                ProbeState::Stale(_) => tracing::debug!("[{probe}] stale"),
                 _ => tracing::info!("[{probe}] {}", state.as_str()),
             },
             Event::TargetState { target, state, .. } => {
                 let s = match state {
                     TargetState::Green => "green",
-                    TargetState::Red => "red",
-                    TargetState::Stale => "stale",
-                    TargetState::Stopped => "stopped",
+                    TargetState::Red(_) => "red",
+                    TargetState::Stale { .. } => "stale",
                 };
                 tracing::info!("[{target}] {s}");
             }
@@ -512,7 +513,7 @@ mod tests {
         let probe = Event::probe_state_change(
             &ProbeRef::new("db", "port"),
             ProbeState::Green,
-            ProbeState::Red,
+            ProbeState::Red(crate::model::RedReason::Stopped),
             "green",
         );
         assert_eq!(probe.to_ws_event().category, "probe_state");
@@ -536,7 +537,7 @@ mod tests {
         // Stale probe state is debug
         let stale = Event::probe_state_change(
             &ProbeRef::new("db", "port"),
-            ProbeState::Stale,
+            ProbeState::Stale(crate::model::StaleReason::Reprobing),
             ProbeState::Green,
             "stale",
         );
@@ -546,7 +547,7 @@ mod tests {
         let green = Event::probe_state_change(
             &ProbeRef::new("db", "port"),
             ProbeState::Green,
-            ProbeState::Stale,
+            ProbeState::Stale(crate::model::StaleReason::Reprobing),
             "green",
         );
         assert_eq!(green.to_ws_event().level, "info");
@@ -561,7 +562,7 @@ mod tests {
         let probe = Event::probe_state_change(
             &ProbeRef::new("db", "port"),
             ProbeState::Green,
-            ProbeState::Red,
+            ProbeState::Red(crate::model::RedReason::Stopped),
             "green",
         );
         let ws = probe.to_ws_event();

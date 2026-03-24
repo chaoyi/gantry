@@ -72,10 +72,11 @@ async fn build_snapshot(state: &AppState) -> serde_json::Value {
         let mut probes = serde_json::Map::new();
         for (probe_name, probe_rt) in &svc.probes {
             let display = ProbeDisplayState::from_probe(probe_rt, svc.state);
-            probes.insert(
-                probe_name.clone(),
-                serde_json::json!({ "state": display.as_str() }),
-            );
+            let mut probe_json = serde_json::json!({ "state": display.as_str() });
+            if let Some(reason) = probe_rt.state.reason() {
+                probe_json["reason"] = serde_json::json!(reason);
+            }
+            probes.insert(probe_name.clone(), probe_json);
         }
         let svc_display = SvcDisplayState::from_service(svc);
         svc_states.insert(

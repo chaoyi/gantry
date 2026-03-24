@@ -193,32 +193,36 @@ impl DependencyGraph {
 
         while let Some(current) = queue.pop_front() {
             // Determine what state to propagate from current node
-            let propagate_as = ProbeRef::parse(&current)
+            let source_is_red = ProbeRef::parse(&current)
                 .and_then(|pr| {
                     services
                         .get(&pr.service)?
                         .probes
                         .get(&pr.probe)
-                        .map(|p| p.state)
+                        .map(|p| p.state.is_red())
                 })
-                .map_or(ProbeState::Stale, |s| {
-                    if s == ProbeState::Red {
-                        ProbeState::Red
-                    } else {
-                        ProbeState::Stale
-                    }
-                });
+                .unwrap_or(false);
+
+            let current_ref = ProbeRef::parse(&current).unwrap();
 
             for dep_key in self.reverse_depends_on(&current) {
                 if let Some(probe_ref) = ProbeRef::parse(&dep_key)
                     && let Some(svc) = services.get_mut(&probe_ref.service)
                     && let Some(probe) = svc.probes.get_mut(&probe_ref.probe)
-                    && (probe.state == ProbeState::Green
-                        || (propagate_as == ProbeState::Red && probe.state == ProbeState::Stale))
+                    && (probe.state.is_green() || (source_is_red && probe.state.is_stale()))
                 {
-                    let prev = probe.state;
-                    probe.prev_state = Some(prev);
-                    probe.state = propagate_as;
+                    let prev = probe.state.clone();
+                    probe.prev_color = Some(prev.color());
+                    let propagate_as = if source_is_red {
+                        ProbeState::Red(crate::model::RedReason::DepRed {
+                            dep: current_ref.clone(),
+                        })
+                    } else {
+                        ProbeState::Stale(crate::model::StaleReason::DepNotReady {
+                            dep: current_ref.clone(),
+                        })
+                    };
+                    probe.state = propagate_as.clone();
                     tracing::debug!("[{dep_key}] {:?} (depends on {current})", propagate_as);
                     changes.push((probe_ref, propagate_as, prev));
                     queue.push_back(dep_key);
@@ -228,7 +232,7 @@ impl DependencyGraph {
     }
 
     /// Mark a probe as red and propagate staleness downstream.
-    /// Returns all (probe_ref, new_state, prev_state) changes.
+    /// Returns all (probe_ref, new_state, prev_color) changes.
     pub fn mark_red(
         &self,
         probe_ref: &ProbeRef,
@@ -239,10 +243,13 @@ impl DependencyGraph {
         if let Some(svc) = services.get_mut(&probe_ref.service)
             && let Some(probe) = svc.probes.get_mut(&probe_ref.probe)
         {
-            let prev = probe.state;
-            probe.prev_state = Some(prev);
-            probe.state = ProbeState::Red;
-            changes.push((probe_ref.clone(), ProbeState::Red, prev));
+            let prev = probe.state.clone();
+            probe.prev_color = Some(prev.color());
+            let new_state = ProbeState::Red(crate::model::RedReason::DepRed {
+                dep: probe_ref.clone(),
+            });
+            probe.state = new_state.clone();
+            changes.push((probe_ref.clone(), new_state, prev));
         }
         self.propagate_staleness(&probe_key, services, changes);
     }
@@ -259,6 +266,7 @@ impl DependencyGraph {
         queue.push_back(probe_key.to_string());
 
         while let Some(current) = queue.pop_front() {
+            let current_ref = ProbeRef::parse(&current).unwrap();
             for dep_key in self.reverse_depends_on(&current) {
                 let Some(probe_ref) = ProbeRef::parse(&dep_key) else {
                     continue;
@@ -271,7 +279,7 @@ impl DependencyGraph {
                             && services
                                 .get(&dep.service)
                                 .and_then(|s| s.probes.get(&dep.probe))
-                                .is_some_and(|p| p.state == ProbeState::Red)
+                                .is_some_and(|p| p.state.is_red())
                     })
                 };
                 if has_other_red {
@@ -279,13 +287,16 @@ impl DependencyGraph {
                 }
                 if let Some(svc) = services.get_mut(&probe_ref.service)
                     && let Some(probe) = svc.probes.get_mut(&probe_ref.probe)
-                    && probe.state != ProbeState::Stale
+                    && !probe.state.is_stale()
                 {
-                    let prev = probe.state;
-                    probe.prev_state = Some(prev);
-                    probe.state = ProbeState::Stale;
+                    let prev = probe.state.clone();
+                    probe.prev_color = Some(prev.color());
+                    let new_state = ProbeState::Stale(crate::model::StaleReason::DepRecovered {
+                        dep: current_ref.clone(),
+                    });
+                    probe.state = new_state.clone();
                     tracing::debug!("[{dep_key}] stale (dependency {current} recovered)");
-                    changes.push((probe_ref, ProbeState::Stale, prev));
+                    changes.push((probe_ref, new_state, prev));
                     queue.push_back(dep_key);
                 }
             }
@@ -465,13 +476,13 @@ targets:
         graph.mark_red(&db_port, &mut state.services, &mut changes);
 
         // db.port should be red
-        assert_eq!(state.services["db"].probes["port"].state, ProbeState::Red);
+        assert!(state.services["db"].probes["port"].state.is_red());
         // db.ready depends on db.port -> red (source is red)
-        assert_eq!(state.services["db"].probes["ready"].state, ProbeState::Red);
+        assert!(state.services["db"].probes["ready"].state.is_red());
         // app.http depends on db.ready -> red (transitive from red source)
-        assert_eq!(state.services["app"].probes["http"].state, ProbeState::Red);
+        assert!(state.services["app"].probes["http"].state.is_red());
         // app.ready depends on app.http -> red
-        assert_eq!(state.services["app"].probes["ready"].state, ProbeState::Red);
+        assert!(state.services["app"].probes["ready"].state.is_red());
     }
 
     #[test]
@@ -491,7 +502,7 @@ targets:
         let db_port = ProbeRef::new("db", "port");
         let mut changes = Vec::new();
         graph.mark_red(&db_port, &mut state.services, &mut changes);
-        assert_eq!(state.services["app"].probes["http"].state, ProbeState::Red);
+        assert!(state.services["app"].probes["http"].state.is_red());
 
         // Simulate: app.http reprobed while dep is red → stays red
         state
@@ -501,7 +512,7 @@ targets:
             .probes
             .get_mut("http")
             .unwrap()
-            .state = ProbeState::Red;
+            .state = ProbeState::Red(crate::model::RedReason::Stopped);
 
         // Now db.port recovers to green → recovery propagation
         state
@@ -526,7 +537,7 @@ targets:
             .probes
             .get_mut("http")
             .unwrap()
-            .state = ProbeState::Red;
+            .state = ProbeState::Red(crate::model::RedReason::Stopped);
 
         // Simulate db.ready also recovers
         state
@@ -541,14 +552,11 @@ targets:
         graph.propagate_recovery("db.ready", &mut state.services, &mut recovery2);
 
         // app.http was red → now stale (recovery propagation)
-        assert_eq!(
-            state.services["app"].probes["http"].state,
-            ProbeState::Stale
-        );
+        assert!(state.services["app"].probes["http"].state.is_stale());
         assert!(
             recovery2
                 .iter()
-                .any(|(pr, new, _)| pr.to_string() == "app.http" && *new == ProbeState::Stale)
+                .any(|(pr, new, _)| pr.to_string() == "app.http" && new.is_stale())
         );
     }
 
@@ -578,15 +586,9 @@ targets:
         graph.propagate_recovery("db.port", &mut state.services, &mut changes);
 
         // db.ready was green → now stale (green dependents also staled)
-        assert_eq!(
-            state.services["db"].probes["ready"].state,
-            ProbeState::Stale
-        );
+        assert!(state.services["db"].probes["ready"].state.is_stale());
         // app.http was green → now stale (transitive)
-        assert_eq!(
-            state.services["app"].probes["http"].state,
-            ProbeState::Stale
-        );
+        assert!(state.services["app"].probes["http"].state.is_stale());
     }
 
     #[test]
@@ -706,7 +708,7 @@ targets:
         let non_green: Vec<String> = state.services["web"]
             .probes
             .iter()
-            .filter(|(_, probe)| probe.state != ProbeState::Green)
+            .filter(|(_, probe)| !probe.state.is_green())
             .map(|(name, _)| format!("web.{name}"))
             .collect();
         let mut changes = Vec::new();
@@ -716,10 +718,7 @@ targets:
 
         // Nothing should change — all probes are green, no propagation needed.
         assert!(changes.is_empty());
-        assert_eq!(
-            state.services["web"].probes["ready"].state,
-            ProbeState::Green
-        );
+        assert!(state.services["web"].probes["ready"].state.is_green());
     }
 
     #[test]
@@ -744,16 +743,16 @@ targets:
             .probes
             .get_mut("http")
             .unwrap()
-            .state = ProbeState::Red;
+            .state = ProbeState::Red(crate::model::RedReason::Stopped);
         let mut changes = Vec::new();
         graph.propagate_staleness("web.http", &mut state.services, &mut changes);
 
         // web.ready (depends on web.http, was green) → now RED (source is Red)
-        assert_eq!(state.services["web"].probes["ready"].state, ProbeState::Red);
+        assert!(state.services["web"].probes["ready"].state.is_red());
         assert!(
             changes
                 .iter()
-                .any(|(pr, new, _)| pr.to_string() == "web.ready" && *new == ProbeState::Red)
+                .any(|(pr, new, _)| pr.to_string() == "web.ready" && new.is_red())
         );
     }
 
@@ -855,7 +854,7 @@ targets:
             .probes
             .get_mut("http")
             .unwrap()
-            .state = ProbeState::Red;
+            .state = ProbeState::Red(crate::model::RedReason::Stopped);
 
         // web.http recovers to green → propagate_recovery
         state
@@ -870,21 +869,12 @@ targets:
         graph.propagate_recovery("web.http", &mut state.services, &mut changes);
 
         // web.ready should be stale (depends on web.http)
-        assert_eq!(
-            state.services["web"].probes["ready"].state,
-            ProbeState::Stale
-        );
+        assert!(state.services["web"].probes["ready"].state.is_stale());
 
         // app.ready should NOT be affected (doesn't depend on web.http)
-        assert_eq!(
-            state.services["app"].probes["ready"].state,
-            ProbeState::Green
-        );
+        assert!(state.services["app"].probes["ready"].state.is_green());
         // app.http should NOT be affected
-        assert_eq!(
-            state.services["app"].probes["http"].state,
-            ProbeState::Green
-        );
+        assert!(state.services["app"].probes["http"].state.is_green());
     }
 
     #[test]
@@ -898,7 +888,7 @@ targets:
         for svc in state.services.values_mut() {
             svc.state = crate::model::ServiceState::Running;
             for probe in svc.probes.values_mut() {
-                probe.state = ProbeState::Stale;
+                probe.state = ProbeState::Stale(crate::model::StaleReason::Reprobing);
             }
         }
 
@@ -922,12 +912,18 @@ targets:
                             .services
                             .get(&dep.service)
                             .and_then(|s| s.probes.get(&dep.probe))
-                            .is_some_and(|p| p.state == ProbeState::Green)
+                            .is_some_and(|p| p.state.is_green())
                     });
                     let new_state = if deps_all_green {
                         ProbeState::Green
                     } else {
-                        ProbeState::Stale
+                        ProbeState::Stale(crate::model::StaleReason::DepNotReady {
+                            dep: probe
+                                .depends_on
+                                .first()
+                                .cloned()
+                                .unwrap_or_else(|| ProbeRef::new(svc_name, probe_name)),
+                        })
                     };
                     state
                         .services
@@ -936,10 +932,10 @@ targets:
                         .probes
                         .get_mut(probe_name)
                         .unwrap()
-                        .state = new_state;
+                        .state = new_state.clone();
 
                     // Recovery propagation if went green
-                    if new_state == ProbeState::Green {
+                    if new_state.is_green() {
                         let mut changes = Vec::new();
                         graph.propagate_recovery(
                             &format!("{svc_name}.{probe_name}"),
@@ -961,7 +957,9 @@ targets:
                     let new_state = if satisfied {
                         ProbeState::Green
                     } else {
-                        ProbeState::Red
+                        ProbeState::Red(crate::model::RedReason::DepRed {
+                            dep: ProbeRef::new(svc_name, probe_name),
+                        })
                     };
                     state
                         .services
@@ -970,8 +968,8 @@ targets:
                         .probes
                         .get_mut(probe_name)
                         .unwrap()
-                        .state = new_state;
-                    if new_state == ProbeState::Green {
+                        .state = new_state.clone();
+                    if new_state.is_green() {
                         let mut changes = Vec::new();
                         graph.propagate_recovery(
                             &format!("{svc_name}.{probe_name}"),
@@ -986,9 +984,8 @@ targets:
         // ALL probes should be green
         for (svc_name, svc) in &state.services {
             for (probe_name, probe) in &svc.probes {
-                assert_eq!(
-                    probe.state,
-                    ProbeState::Green,
+                assert!(
+                    probe.state.is_green(),
                     "{svc_name}.{probe_name} should be green but is {:?}",
                     probe.state
                 );
@@ -1030,7 +1027,7 @@ targets:
             .probes
             .get_mut("http")
             .unwrap()
-            .state = ProbeState::Stale;
+            .state = ProbeState::Stale(crate::model::StaleReason::Reprobing);
         state
             .services
             .get_mut("db")
@@ -1049,9 +1046,8 @@ targets:
         );
 
         // app.http was stale, dep went red → should now be red
-        assert_eq!(
-            state.services["app"].probes["http"].state,
-            ProbeState::Red,
+        assert!(
+            state.services["app"].probes["http"].state.is_red(),
             "stale probe with red dep should become red"
         );
     }
@@ -1092,7 +1088,7 @@ targets:
         // All red initially
         for (_, svc) in state.services.iter_mut() {
             for (_, probe) in svc.probes.iter_mut() {
-                probe.state = ProbeState::Red;
+                probe.state = ProbeState::Red(crate::model::RedReason::Stopped);
             }
         }
 
@@ -1109,9 +1105,8 @@ targets:
         graph.propagate_recovery("db.ready", &mut state.services, &mut changes);
 
         // app.http should stay red — redis.port is still red
-        assert_eq!(
-            state.services["app"].probes["http"].state,
-            ProbeState::Red,
+        assert!(
+            state.services["app"].probes["http"].state.is_red(),
             "should stay red when another dep is still red"
         );
     }
@@ -1172,13 +1167,12 @@ targets:
             .probes
             .get_mut("port")
             .unwrap()
-            .state = ProbeState::Red;
+            .state = ProbeState::Red(crate::model::RedReason::Stopped);
 
         // full target should not be green (infra dep is red)
         let full_state = state.targets["full"].state(&state.services);
-        assert_ne!(
-            full_state,
-            crate::model::TargetState::Green,
+        assert!(
+            !full_state.is_green(),
             "target should not be green when dependent target's probes are red"
         );
     }

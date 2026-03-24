@@ -1,4 +1,4 @@
-use crate::model::{ProbeRef, ProbeState, ServiceRuntime};
+use crate::model::{ProbeRef, ServiceRuntime};
 use indexmap::IndexMap;
 
 /// A meta probe is satisfied when all its depends_on are satisfied.
@@ -30,7 +30,7 @@ pub fn is_probe_satisfied(
     let Some(probe) = svc.probes.get(&probe_ref.probe) else {
         return false;
     };
-    if probe.state != ProbeState::Green {
+    if !probe.state.is_green() {
         return false;
     }
     // Check transitive deps
@@ -46,13 +46,13 @@ pub fn is_probe_satisfied(
 mod tests {
     use super::*;
     use crate::config::ProbeConfig;
-    use crate::model::{ProbeRuntime, ServiceState};
+    use crate::model::{ProbeRuntime, ProbeState, ServiceState};
 
     fn make_probe(name: &str, svc: &str, state: ProbeState, deps: Vec<ProbeRef>) -> ProbeRuntime {
         ProbeRuntime {
             probe_ref: ProbeRef::new(svc, name),
-            state,
-            prev_state: None,
+            state: state.clone(),
+            prev_color: None,
             probe_config: ProbeConfig::Meta,
             depends_on: deps,
             last_probe_ms: None,
@@ -94,7 +94,7 @@ mod tests {
                 make_probe(
                     "ready",
                     "svc",
-                    ProbeState::Red,
+                    ProbeState::Red(crate::model::RedReason::Stopped),
                     vec![ProbeRef::new("svc", "port"), ProbeRef::new("svc", "http")],
                 ),
             ],
@@ -110,11 +110,16 @@ mod tests {
             "svc",
             ServiceState::Running,
             vec![
-                make_probe("port", "svc", ProbeState::Red, vec![]),
+                make_probe(
+                    "port",
+                    "svc",
+                    ProbeState::Red(crate::model::RedReason::Stopped),
+                    vec![],
+                ),
                 make_probe(
                     "ready",
                     "svc",
-                    ProbeState::Red,
+                    ProbeState::Red(crate::model::RedReason::Stopped),
                     vec![ProbeRef::new("svc", "port")],
                 ),
             ],
@@ -130,11 +135,16 @@ mod tests {
             "svc",
             ServiceState::Running,
             vec![
-                make_probe("port", "svc", ProbeState::Stale, vec![]),
+                make_probe(
+                    "port",
+                    "svc",
+                    ProbeState::Stale(crate::model::StaleReason::Reprobing),
+                    vec![],
+                ),
                 make_probe(
                     "ready",
                     "svc",
-                    ProbeState::Red,
+                    ProbeState::Red(crate::model::RedReason::Stopped),
                     vec![ProbeRef::new("svc", "port")],
                 ),
             ],
@@ -154,7 +164,7 @@ mod tests {
                 make_probe(
                     "ready",
                     "svc",
-                    ProbeState::Red,
+                    ProbeState::Red(crate::model::RedReason::Stopped),
                     vec![ProbeRef::new("svc", "port")],
                 ),
             ],
@@ -184,7 +194,7 @@ mod tests {
                 make_probe(
                     "ready",
                     "app",
-                    ProbeState::Red,
+                    ProbeState::Red(crate::model::RedReason::Stopped),
                     vec![ProbeRef::new("app", "http")],
                 ),
             ],

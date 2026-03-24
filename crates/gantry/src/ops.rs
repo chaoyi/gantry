@@ -72,12 +72,16 @@ pub struct OpActions {
     pub restarted: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub stopped: Vec<String>,
+    #[serde(skip_serializing_if = "indexmap::IndexMap::is_empty")]
+    pub start_errors: indexmap::IndexMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ProbeStatus {
     pub state: String,
     pub prev: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub probe_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -118,11 +122,11 @@ pub fn emit_propagated_changes(
             ProbeDisplayState::Stopped
         };
         let display_str = display.as_str();
-        if new_state != prev {
+        if new_state.as_str() != prev.as_str() {
             state.events.emit(Event::probe_state_change(
                 cr,
-                *new_state,
-                *prev,
+                new_state.clone(),
+                prev.clone(),
                 display_str,
             ));
         }
@@ -131,6 +135,7 @@ pub fn emit_propagated_changes(
             ProbeStatus {
                 state: display_str.into(),
                 prev: prev.as_str().into(),
+                reason: new_state.reason(),
                 probe_ms: None,
                 error: None,
                 logs: None,
@@ -155,13 +160,13 @@ fn check_deps(
         services
             .get(&dep.service)
             .and_then(|s| s.probes.get(&dep.probe))
-            .is_some_and(|c| c.state == ProbeState::Green)
+            .is_some_and(|c| c.state.is_green())
     });
     let any_red = deps.iter().any(|dep| {
         services
             .get(&dep.service)
             .and_then(|s| s.probes.get(&dep.probe))
-            .is_none_or(|c| c.state == ProbeState::Red)
+            .is_none_or(|c| c.state.is_red())
     });
     (all_green, any_red)
 }
@@ -180,27 +185,52 @@ async fn apply_ok_result(
     services: &mut indexmap::IndexMap<String, crate::model::ServiceRuntime>,
     probe_statuses: &mut indexmap::IndexMap<String, ProbeStatus>,
 ) {
+    let deps = &services[&probe_ref.service].probes[&probe_ref.probe].depends_on;
     let (new_state, dep_error) = if deps_all_green {
         (ProbeState::Green, None)
     } else if deps_any_red {
-        // Find which deps are red for the error message
-        let red_deps: Vec<String> = services[&probe_ref.service].probes[&probe_ref.probe]
-            .depends_on
+        // Find first red dep for the reason
+        let first_red_dep = deps
+            .iter()
+            .find(|d| {
+                services
+                    .get(&d.service)
+                    .and_then(|s| s.probes.get(&d.probe))
+                    .is_none_or(|p| p.state.is_red())
+            })
+            .cloned()
+            .unwrap_or_else(|| probe_ref.clone());
+        let red_deps: Vec<String> = deps
             .iter()
             .filter(|d| {
                 services
                     .get(&d.service)
                     .and_then(|s| s.probes.get(&d.probe))
-                    .is_none_or(|p| p.state == ProbeState::Red)
+                    .is_none_or(|p| p.state.is_red())
             })
             .map(|d| d.to_string())
             .collect();
         (
-            ProbeState::Red,
+            ProbeState::Red(crate::model::RedReason::DepRed { dep: first_red_dep }),
             Some(format!("dep red: {}", red_deps.join(", "))),
         )
     } else {
-        (ProbeState::Stale, Some("deps not all green".into()))
+        let first_non_green_dep = deps
+            .iter()
+            .find(|d| {
+                services
+                    .get(&d.service)
+                    .and_then(|s| s.probes.get(&d.probe))
+                    .is_some_and(|p| !p.state.is_green())
+            })
+            .cloned()
+            .unwrap_or_else(|| probe_ref.clone());
+        (
+            ProbeState::Stale(crate::model::StaleReason::DepNotReady {
+                dep: first_non_green_dep,
+            }),
+            Some("deps not all green".into()),
+        )
     };
 
     let probe = services
@@ -209,16 +239,16 @@ async fn apply_ok_result(
         .probes
         .get_mut(&probe_ref.probe)
         .unwrap();
-    let prev = probe.state;
-    probe.prev_state = Some(prev);
-    probe.state = new_state;
+    let prev = probe.state.clone();
+    probe.prev_color = Some(prev.color());
+    probe.state = new_state.clone();
     probe.last_probe_ms = Some(duration_ms);
     probe.last_error = dep_error.clone();
 
     state.events.emit(Event::probe_state_change(
         probe_ref,
-        new_state,
-        prev,
+        new_state.clone(),
+        prev.clone(),
         new_state.as_str(),
     ));
     probe_statuses.insert(
@@ -226,6 +256,7 @@ async fn apply_ok_result(
         ProbeStatus {
             state: new_state.as_str().into(),
             prev: prev.as_str().into(),
+            reason: new_state.reason(),
             probe_ms: Some(duration_ms),
             error: dep_error,
             logs: None,
@@ -234,7 +265,7 @@ async fn apply_ok_result(
 
     // Recovery propagation: when a probe goes green, mark red reverse-deps as stale
     // (their dependency recovered, they should be reprobed)
-    if new_state == ProbeState::Green && prev != ProbeState::Green {
+    if new_state.is_green() && !prev.is_green() {
         let graph = state.graph.read().await;
         let mut recovery_changes = Vec::new();
         graph.propagate_recovery(&probe_ref.to_string(), services, &mut recovery_changes);
@@ -254,22 +285,28 @@ async fn apply_failed_result(
     services: &mut indexmap::IndexMap<String, crate::model::ServiceRuntime>,
     probe_statuses: &mut indexmap::IndexMap<String, ProbeStatus>,
 ) {
+    let new_state = ProbeState::Red(crate::model::RedReason::ProbeFailed(
+        crate::model::ProbeFailure {
+            error: error.to_string(),
+            duration_ms,
+        },
+    ));
     let probe = services
         .get_mut(&probe_ref.service)
         .unwrap()
         .probes
         .get_mut(&probe_ref.probe)
         .unwrap();
-    let prev = probe.state;
-    probe.prev_state = Some(prev);
-    probe.state = ProbeState::Red;
+    let prev = probe.state.clone();
+    probe.prev_color = Some(prev.color());
+    probe.state = new_state.clone();
     probe.last_probe_ms = Some(duration_ms);
     probe.last_error = Some(error.to_string());
 
     state.events.emit(Event::probe_state_change(
         probe_ref,
-        ProbeState::Red,
-        prev,
+        new_state,
+        prev.clone(),
         "red",
     ));
     probe_statuses.insert(
@@ -277,6 +314,7 @@ async fn apply_failed_result(
         ProbeStatus {
             state: "red".into(),
             prev: prev.as_str().into(),
+            reason: Some(format!("probe failed: {error}")),
             probe_ms: Some(duration_ms),
             error: Some(error.to_string()),
             logs: None,
@@ -284,7 +322,7 @@ async fn apply_failed_result(
     );
 
     // Red propagation: when a probe goes red, propagate to dependents
-    if prev != ProbeState::Red {
+    if !prev.is_red() {
         let graph = state.graph.read().await;
         let mut red_changes = Vec::new();
         graph.propagate_staleness(&probe_ref.to_string(), services, &mut red_changes);
@@ -397,21 +435,35 @@ pub async fn update_meta_probes(
     for probe_name in meta_probes {
         let probe_ref = ProbeRef::new(service_name, &probe_name);
         let satisfied = crate::probe::meta::is_satisfied(&probe_ref, &services);
-        let svc = services.get_mut(service_name).unwrap();
-        let probe = svc.probes.get_mut(&probe_name).unwrap();
-        let prev = probe.state;
         let new_state = if satisfied {
             ProbeState::Green
         } else {
-            ProbeState::Red
+            // Find the first unsatisfied dep for the reason
+            let deps = &services[service_name].probes[&probe_name].depends_on;
+            let first_unsatisfied = deps
+                .iter()
+                .find(|dep| {
+                    !services
+                        .get(&dep.service)
+                        .and_then(|s| s.probes.get(&dep.probe))
+                        .is_some_and(|p| p.state.is_green())
+                })
+                .cloned()
+                .unwrap_or_else(|| probe_ref.clone());
+            ProbeState::Red(crate::model::RedReason::DepRed {
+                dep: first_unsatisfied,
+            })
         };
-        probe.prev_state = Some(prev);
-        probe.state = new_state;
-        if new_state != prev {
+        let svc = services.get_mut(service_name).unwrap();
+        let probe = svc.probes.get_mut(&probe_name).unwrap();
+        let prev = probe.state.clone();
+        probe.prev_color = Some(prev.color());
+        probe.state = new_state.clone();
+        if new_state.as_str() != prev.as_str() {
             state.events.emit(Event::probe_state_change(
                 &probe_ref,
-                new_state,
-                prev,
+                new_state.clone(),
+                prev.clone(),
                 new_state.as_str(),
             ));
         }
@@ -420,6 +472,7 @@ pub async fn update_meta_probes(
             ProbeStatus {
                 state: new_state.as_str().into(),
                 prev: prev.as_str().into(),
+                reason: new_state.reason(),
                 probe_ms: None,
                 error: None,
                 logs: None,
@@ -479,6 +532,7 @@ pub async fn resolve_probe_batch(
 }
 
 /// Collect stale or red non-meta probes. Used by converge where both need reprobing.
+/// Always skips probes for stopped services — they can't be probed.
 pub async fn collect_stale_or_red_probes(
     state: &AppState,
     scope: Option<&[ProbeRef]>,
@@ -488,8 +542,11 @@ pub async fn collect_stale_or_red_probes(
     let mut result = Vec::new();
 
     let mut try_add = |pr: ProbeRef, svc: &crate::model::ServiceRuntime| {
+        if svc.state == ServiceState::Stopped {
+            return;
+        }
         if let Some(probe) = svc.probes.get(&pr.probe)
-            && (probe.state == ProbeState::Stale || probe.state == ProbeState::Red)
+            && (probe.state.is_stale() || probe.state.is_red())
             && !matches!(probe.probe_config, ProbeConfig::Meta)
         {
             result.push((
@@ -511,9 +568,6 @@ pub async fn collect_stale_or_red_probes(
         }
         None => {
             for (svc_name, svc) in services.iter() {
-                if svc.state == ServiceState::Stopped {
-                    continue;
-                }
                 for probe_name in svc.probes.keys() {
                     try_add(ProbeRef::new(svc_name, probe_name), svc);
                 }
@@ -534,7 +588,7 @@ pub async fn collect_stale_probes(
 
     let mut try_add = |pr: ProbeRef, svc: &crate::model::ServiceRuntime| {
         if let Some(probe) = svc.probes.get(&pr.probe)
-            && probe.state == ProbeState::Stale
+            && probe.state.is_stale()
             && !matches!(probe.probe_config, ProbeConfig::Meta)
         {
             result.push((
@@ -616,6 +670,7 @@ pub async fn probe_and_resolve_with_retry(
 
 /// Probe stale probes in parallel using single-attempt probes, then resolve in topo order.
 /// Used by reprobe operations (quick state check on already-running services).
+/// Skips probes whose deps are Red or Stale — no wasted work.
 pub async fn probe_and_resolve(
     state: &AppState,
     stale_probes: &[(ProbeRef, String, String, ProbeConfig)],
@@ -625,8 +680,69 @@ pub async fn probe_and_resolve(
     if stale_probes.is_empty() {
         return;
     }
+
+    // Partition: only probe when all deps are Green; skip if any dep Red/Stale
+    let (to_probe, to_skip): (Vec<_>, Vec<_>) = {
+        let services = state.services.read().await;
+        stale_probes.iter().partition(|(probe_ref, _, _, _)| {
+            let deps = &services[&probe_ref.service].probes[&probe_ref.probe].depends_on;
+            deps.iter().all(|dep| {
+                services
+                    .get(&dep.service)
+                    .and_then(|s| s.probes.get(&dep.probe))
+                    .is_some_and(|p| p.state.is_green())
+            })
+        })
+    };
+
+    // Mark skipped probes with dep-aware state
+    if !to_skip.is_empty() {
+        let mut services = state.services.write().await;
+        for (probe_ref, _, _, _) in &to_skip {
+            let deps = &services[&probe_ref.service].probes[&probe_ref.probe].depends_on;
+            let first_red_dep = deps
+                .iter()
+                .find(|dep| {
+                    services
+                        .get(&dep.service)
+                        .and_then(|s| s.probes.get(&dep.probe))
+                        .is_none_or(|p| p.state.is_red())
+                })
+                .cloned();
+            let any_red = first_red_dep.is_some();
+            let probe = services
+                .get_mut(&probe_ref.service)
+                .unwrap()
+                .probes
+                .get_mut(&probe_ref.probe)
+                .unwrap();
+            let prev = probe.state.clone();
+            if let Some(red_dep) = first_red_dep {
+                probe.state = ProbeState::Red(crate::model::RedReason::DepRed { dep: red_dep });
+            }
+            // else: stays Stale (dep is Stale)
+            probe.prev_color = Some(prev.color());
+            probe_statuses.insert(
+                probe_ref.to_string(),
+                ProbeStatus {
+                    state: probe.state.as_str().into(),
+                    prev: prev.as_str().into(),
+                    reason: probe.state.reason(),
+                    probe_ms: None,
+                    error: if any_red {
+                        Some("dep red".into())
+                    } else {
+                        Some("dep not ready".into())
+                    },
+                    logs: None,
+                },
+            );
+        }
+    }
+
+    // Probe the rest
     let docker = state.docker.inner();
-    let probe_futures: Vec<_> = stale_probes
+    let probe_futures: Vec<_> = to_probe
         .iter()
         .map(|(probe_ref, svc_name, container, probe_config)| {
             let docker = docker.clone();
@@ -684,21 +800,22 @@ pub async fn emit_target_states(
         }
 
         let current = tgt.state(&services);
-        let prev = tgt.last_emitted_state;
-        let changed = prev != Some(current);
+        let prev = &tgt.last_emitted_state;
+        let changed = prev.as_ref().map(|p| p.as_str()) != Some(current.as_str());
 
         statuses.insert(
             name.clone(),
             TargetStatus {
                 state: current.as_str().into(),
                 prev: prev
+                    .as_ref()
                     .map(|p| p.as_str().to_string())
                     .unwrap_or_else(|| current.as_str().into()),
             },
         );
 
         if changed {
-            tgt.last_emitted_state = Some(current);
+            tgt.last_emitted_state = Some(current.clone());
             state.events.emit(Event::target_state(name, current, None));
         }
     }

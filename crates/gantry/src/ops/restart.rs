@@ -11,7 +11,7 @@ pub async fn restart(
 ) -> Result<OpResponse> {
     // Stop then start
     let _stop_result = super::stop::stop(state, service_name).await?;
-    let start_result = super::start::start(state, service_name, timeout).await?;
+    let start_result = super::start::start(state, service_name, timeout, true).await?;
 
     let mut response = start_result;
     response.actions.restarted.push(service_name.to_string());

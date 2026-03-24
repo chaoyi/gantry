@@ -114,16 +114,13 @@ pub async fn reprobe_all(state: &AppState, timeout: Duration) -> Result<OpRespon
                 continue;
             }
             for (probe_name, probe) in svc.probes.iter_mut() {
-                if probe.state == ProbeState::Green || probe.state == ProbeState::Stale {
-                    let prev = probe.state;
-                    probe.prev_state = Some(prev);
-                    probe.state = ProbeState::Stale;
-                    if prev != ProbeState::Stale {
-                        changes.push((
-                            ProbeRef::new(svc_name, probe_name),
-                            ProbeState::Stale,
-                            prev,
-                        ));
+                if probe.state.is_green() || probe.state.is_stale() {
+                    let prev = probe.state.clone();
+                    probe.prev_color = Some(prev.color());
+                    let new_state = ProbeState::Stale(crate::model::StaleReason::Reprobing);
+                    probe.state = new_state.clone();
+                    if !prev.is_stale() {
+                        changes.push((ProbeRef::new(svc_name, probe_name), new_state, prev));
                     }
                 }
             }
@@ -189,7 +186,7 @@ pub async fn reprobe_all(state: &AppState, timeout: Duration) -> Result<OpRespon
                         services
                             .get(&dep.service)
                             .and_then(|s| s.probes.get(&dep.probe))
-                            .is_some_and(|c| c.state == ProbeState::Green)
+                            .is_some_and(|c| c.state.is_green())
                     })
                 };
                 if deps_ok {
@@ -245,12 +242,13 @@ async fn mark_stale_and_propagate(
     for probe_ref in probe_refs {
         if let Some(svc) = services.get_mut(&probe_ref.service)
             && let Some(probe) = svc.probes.get_mut(&probe_ref.probe)
-            && probe.state == ProbeState::Green
+            && probe.state.is_green()
         {
-            let prev = probe.state;
-            probe.prev_state = Some(prev);
-            probe.state = ProbeState::Stale;
-            changes.push((probe_ref.clone(), ProbeState::Stale, prev));
+            let prev = probe.state.clone();
+            probe.prev_color = Some(prev.color());
+            let new_state = ProbeState::Stale(crate::model::StaleReason::Reprobing);
+            probe.state = new_state.clone();
+            changes.push((probe_ref.clone(), new_state, prev));
         }
         graph.propagate_staleness(&probe_ref.to_string(), &mut services, &mut changes);
     }

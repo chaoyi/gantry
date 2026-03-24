@@ -127,7 +127,7 @@ async fn start_service(
         .try_acquire(&format!("start {name}"))
         .map_err(err_response)?;
     let timeout = Duration::from_secs(q.timeout);
-    crate::ops::start::start(&state, &name, timeout)
+    crate::ops::start::start(&state, &name, timeout, true)
         .await
         .map(Json)
         .map_err(err_response)
@@ -240,12 +240,16 @@ async fn get_graph(State(state): State<Arc<AppState>>) -> Json<serde_json::Value
                 ProbeConfig::Log { .. } => "log".into(),
                 ProbeConfig::Meta => "meta".into(),
             };
-            probes.push(serde_json::json!({
+            let mut probe_json = serde_json::json!({
                 "name": probe_name,
                 "state": display.as_str(),
                 "probe_type": probe_type,
                 "depends_on": probe_rt.depends_on.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
-            }));
+            });
+            if let Some(reason) = probe_rt.state.reason() {
+                probe_json["reason"] = serde_json::json!(reason);
+            }
+            probes.push(probe_json);
         }
         let svc_display = SvcDisplayState::from_service(svc);
         svc_list.push(serde_json::json!({
@@ -262,14 +266,18 @@ async fn get_graph(State(state): State<Arc<AppState>>) -> Json<serde_json::Value
     let mut tgt_list = Vec::new();
     for (name, tgt) in targets.iter() {
         let state_val = tgt.state(&services);
-        tgt_list.push(serde_json::json!({
+        let mut tgt_json = serde_json::json!({
             "name": name,
             "state": state_val.as_str(),
             // "probes" is transitive (for UI highlighting); "direct_probes" is own
             "probes": tgt.transitive_probes.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
             "direct_probes": tgt.direct_probes.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
             "depends_on": tgt.depends_on_targets,
-        }));
+        });
+        if let Some(reason) = state_val.reason() {
+            tgt_json["reason"] = serde_json::json!(reason);
+        }
+        tgt_list.push(tgt_json);
     }
 
     let running = services

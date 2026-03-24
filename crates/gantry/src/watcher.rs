@@ -51,12 +51,6 @@ pub async fn watch_docker_events(state: Arc<AppState>) {
             continue;
         };
 
-        // Skip if gantry is currently running any operation —
-        // the operation will handle state updates itself
-        if state.op_lock.current_op().is_some() {
-            continue;
-        }
-
         match action {
             "die" => handle_die(&state, &svc_name).await,
             "start" => handle_start(&state, &svc_name).await,
@@ -89,13 +83,14 @@ async fn handle_die(state: &AppState, svc_name: &str) {
         for probe_name in &probe_names {
             let probe_ref = ProbeRef::new(svc_name, probe_name);
             let probe = svc.probes.get_mut(probe_name).unwrap();
-            let prev = probe.state;
-            probe.prev_state = Some(prev);
-            probe.state = ProbeState::Red;
+            let prev = probe.state.clone();
+            probe.prev_color = Some(prev.color());
+            let new_state = ProbeState::Red(crate::model::RedReason::ContainerDied);
+            probe.state = new_state.clone();
             state.events.emit(Event::probe_state_change(
                 &probe_ref,
-                ProbeState::Red,
-                prev,
+                new_state,
+                prev.clone(),
                 "stopped",
             ));
             probe_statuses.insert(
@@ -103,6 +98,7 @@ async fn handle_die(state: &AppState, svc_name: &str) {
                 ProbeStatus {
                     state: "stopped".into(),
                     prev: prev.as_str().into(),
+                    reason: Some("container died".into()),
                     probe_ms: None,
                     error: None,
                     logs: None,
@@ -128,6 +124,7 @@ async fn handle_die(state: &AppState, svc_name: &str) {
 /// Container started: mark service running + reprobe to get green/red.
 async fn handle_start(state: &AppState, svc_name: &str) {
     tracing::info!("[{svc_name}] container started (external)");
+    let mut probe_statuses: indexmap::IndexMap<String, ProbeStatus> = indexmap::IndexMap::new();
 
     {
         let mut services = state.services.write().await;
@@ -144,23 +141,50 @@ async fn handle_start(state: &AppState, svc_name: &str) {
             "running",
         ));
 
-        // Mark all probes stale for reprobing
+        // Mark all probes stale for reprobing, track those that were Red
+        let mut was_red: Vec<String> = Vec::new();
         for (probe_name, probe) in svc.probes.iter_mut() {
-            if probe.state != ProbeState::Stale {
-                let prev = probe.state;
-                probe.prev_state = Some(prev);
-                probe.state = ProbeState::Stale;
+            if !probe.state.is_stale() {
+                let prev = probe.state.clone();
+                if prev.is_red() {
+                    was_red.push(probe_name.clone());
+                }
+                probe.prev_color = Some(prev.color());
+                let new_state = ProbeState::Stale(crate::model::StaleReason::ContainerStarted);
+                probe.state = new_state.clone();
                 let probe_ref = ProbeRef::new(svc_name, probe_name);
                 state.events.emit(Event::probe_state_change(
                     &probe_ref,
-                    ProbeState::Stale,
-                    prev,
+                    new_state,
+                    prev.clone(),
                     "stale",
                 ));
+                probe_statuses.insert(
+                    probe_ref.to_string(),
+                    ProbeStatus {
+                        state: "stale".into(),
+                        prev: prev.as_str().into(),
+                        reason: Some("container started externally".into()),
+                        probe_ms: None,
+                        error: None,
+                        logs: None,
+                    },
+                );
             }
         }
+
+        // Propagate recovery to dependents for probes that were Red
+        let graph = state.graph.read().await;
+        let mut changes = Vec::new();
+        for probe_name in &was_red {
+            let probe_key = format!("{svc_name}.{probe_name}");
+            graph.propagate_recovery(&probe_key, &mut services, &mut changes);
+        }
+        emit_propagated_changes(state, &services, &changes, &mut probe_statuses);
     }
 
-    emit_svc_display_states(state, &[svc_name]).await;
+    let all_svcs: Vec<String> = state.services.read().await.keys().cloned().collect();
+    let all_refs: Vec<&str> = all_svcs.iter().map(|s| s.as_str()).collect();
+    emit_svc_display_states(state, &all_refs).await;
     emit_target_states(state, &[svc_name]).await;
 }

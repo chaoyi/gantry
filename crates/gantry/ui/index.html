@@ -146,6 +146,7 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 }
 .tree-probes { overflow: hidden; }
 .tree-probes.collapsed { display: none; }
+.reason-text { font-size: 10px; color: var(--text-dim); opacity: 0.7; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex-shrink: 1; }
 
 .dot-green { background: #00aa44; box-shadow: 0 0 4px #00aa4455; }
 .dot-red { background: #ff0000; box-shadow: 0 0 4px #ff000055; }
@@ -848,8 +849,10 @@ const Graph = {
       const dot = svgEl('circle', { cx: 14, cy: HEADER_H / 2, r: 4, fill: 'var(--gray)', 'data-dot': `svc:${svc.name}` });
       g.appendChild(dot);
 
-      // Service name
-      g.appendChild(svgEl('text', { x: 26, y: HEADER_H / 2 + 4, class: 'svc-header-text', 'data-svc': svc.name })).textContent = svc.name;
+      // Service name (with tooltip for reason)
+      const svcText = svgEl('text', { x: 26, y: HEADER_H / 2 + 4, class: 'svc-header-text', 'data-svc': svc.name, 'data-svc-label': svc.name });
+      svcText.textContent = svc.name;
+      g.appendChild(svcText);
 
       // Runtime state label (right-aligned in header)
       g.appendChild(svgEl('text', { x: p.w - 6, y: HEADER_H / 2 + 3, class: 'svc-runtime-text', 'text-anchor': 'end', 'data-runtime': svc.name }));
@@ -868,8 +871,10 @@ const Graph = {
         // Probe dot
         g.appendChild(svgEl('circle', { cx: 14, cy: cy + PROBE_H / 2, r: 3, fill: 'var(--gray)', 'data-dot': `probe:${svc.name}.${probe.name}` }));
 
-        // Probe name
-        g.appendChild(svgEl('text', { x: 26, y: cy + PROBE_H / 2 + 3, class: 'probe-text' })).textContent = probe.name;
+        // Probe name + reason tooltip
+        const probeText = svgEl('text', { x: 26, y: cy + PROBE_H / 2 + 3, class: 'probe-text', 'data-probe-label': `${svc.name}.${probe.name}` });
+        probeText.textContent = probe.name;
+        g.appendChild(probeText);
 
         // Cross-service dependency indicators (dots + labels if space allows)
         const crossDeps = (probe.depends_on || []).filter(d => d.split('.')[0] !== svc.name);
@@ -952,7 +957,9 @@ const Graph = {
 
       // Status dot + name
       g.appendChild(svgEl('circle', { cx: 14, cy: HEADER_H / 2, r: 4, fill: 'var(--gray)', 'data-dot': `tgt:${tgt.name}` }));
-      g.appendChild(svgEl('text', { x: 26, y: HEADER_H / 2 + 4, class: 'svc-header-text' })).textContent = tgt.name;
+      const tgtText = svgEl('text', { x: 26, y: HEADER_H / 2 + 4, class: 'svc-header-text', 'data-tgt-label': tgt.name });
+      tgtText.textContent = tgt.name;
+      g.appendChild(tgtText);
 
       // Header click area
       const headerHit = svgEl('rect', { width: p.w, height: HEADER_H, fill: 'transparent', cursor: 'pointer' });
@@ -1044,6 +1051,13 @@ const Graph = {
         el.style.fill = stateColor(rs);
         el.classList.toggle('dot-stale-svg', rs === 'stale');
       });
+      // Service header tooltip: show ready probe reason
+      setOne(`[data-svc-label="${svc.name}"]`, el => {
+        const reason = S.services[svc.name]?.probes?.ready?.reason;
+        const title = el.querySelector('title') || document.createElementNS('http://www.w3.org/2000/svg', 'title');
+        title.textContent = reason ? `${svc.name}: ${reason}` : svc.name;
+        if (!el.querySelector('title')) el.appendChild(title);
+      });
 
       setOne(`[data-runtime="${svc.name}"]`, el => {
         const ds = S.services[svc.name]?.state || 'stopped';
@@ -1056,6 +1070,13 @@ const Graph = {
           if (el._probeStart) return; // don't override probe flash
           el.style.fill = stateColor(cs);
           el.classList.toggle('dot-stale-svg', cs === 'stale');
+        });
+        // Update probe tooltip with reason
+        setOne(`[data-probe-label="${svc.name}.${probe.name}"]`, el => {
+          const reason = S.services[svc.name]?.probes?.[probe.name]?.reason;
+          const title = el.querySelector('title') || document.createElementNS('http://www.w3.org/2000/svg', 'title');
+          title.textContent = reason ? `${probe.name}: ${reason}` : probe.name;
+          if (!el.querySelector('title')) el.appendChild(title);
         });
         for (const dep of (probe.depends_on || [])) {
           const [ds, dc] = dep.split('.');
@@ -1074,6 +1095,13 @@ const Graph = {
         el.classList.toggle('dot-stale-svg', ts === 'stale');
       });
       set(`[data-bg="tgt:${tgt.name}"]`, stateBgFill(ts));
+      // Target header tooltip
+      setOne(`[data-tgt-label="${tgt.name}"]`, el => {
+        const reason = S.targets[tgt.name]?.reason;
+        const title = el.querySelector('title') || document.createElementNS('http://www.w3.org/2000/svg', 'title');
+        title.textContent = reason ? `${tgt.name}: ${reason}` : tgt.name;
+        if (!el.querySelector('title')) el.appendChild(title);
+      });
       // Target dep/probe dots use depColor (dependency context: green or red)
       for (const dep of (tgt.depends_on || [])) {
         const ds = targetState(dep);
@@ -1173,7 +1201,7 @@ const Tree = {
         const cn = document.createElement('div');
         cn.className = 'tree-node probe-node';
         cn.dataset.probe = `${svc.name}.${probe.name}`;
-        cn.innerHTML = `<span class="dot dot-gray" data-tree-dot="probe:${svc.name}.${probe.name}"></span><span class="label">${probe.name}</span>`;
+        cn.innerHTML = `<span class="dot dot-gray" data-tree-dot="probe:${svc.name}.${probe.name}"></span><span class="label">${probe.name}</span><span class="reason-text" data-tree-reason="probe:${svc.name}.${probe.name}"></span>`;
         cn.addEventListener('click', (e) => { e.stopPropagation(); Interaction.selectProbe(`${svc.name}.${probe.name}`); });
         probesList.appendChild(cn);
       }
@@ -1199,7 +1227,7 @@ const Tree = {
       const node = document.createElement('div');
       node.className = 'tree-node target-node';
       node.dataset.target = tgt.name;
-      node.innerHTML = `${hasChildren ? `<span class="chevron ${isOpen ? 'open' : ''}">&#9654;</span>` : '<span style="width:12px;display:inline-block"></span>'}<span class="dot dot-gray" data-tree-dot="tgt:${tgt.name}"></span><span class="label">${tgt.name}</span>`;
+      node.innerHTML = `${hasChildren ? `<span class="chevron ${isOpen ? 'open' : ''}">&#9654;</span>` : '<span style="width:12px;display:inline-block"></span>'}<span class="dot dot-gray" data-tree-dot="tgt:${tgt.name}"></span><span class="label">${tgt.name}</span><span class="reason-text" data-tree-reason="tgt:${tgt.name}"></span>`;
       node.addEventListener('click', () => {
         if (hasChildren) {
           if (this.expanded.has(tgtKey)) this.expanded.delete(tgtKey);
@@ -1230,7 +1258,7 @@ const Tree = {
           const cn = document.createElement('div');
           cn.className = 'tree-node probe-node';
           cn.dataset.probe = ref;
-          cn.innerHTML = `<span class="dot dot-gray" data-tree-dot="probe:${ref}"></span><span class="label">${ref}</span>`;
+          cn.innerHTML = `<span class="dot dot-gray" data-tree-dot="probe:${ref}"></span><span class="label">${ref}</span><span class="reason-text" data-tree-reason="probe:${ref}"></span>`;
           cn.addEventListener('click', (e) => { e.stopPropagation(); Interaction.selectProbe(ref); });
           children.appendChild(cn);
         }
@@ -1259,11 +1287,21 @@ const Tree = {
         document.querySelectorAll(`[data-tree-dot="probe:${svc.name}.${probe.name}"]`).forEach(d => {
           d.className = `dot ${stateDotClass(probeState(svc.name, probe.name))}`;
         });
+        const ps = probeState(svc.name, probe.name);
+        const reason = S.services[svc.name]?.probes?.[probe.name]?.reason;
+        document.querySelectorAll(`[data-tree-reason="probe:${svc.name}.${probe.name}"]`).forEach(el => {
+          el.textContent = (ps !== 'green' && reason) ? ` \u2014 ${reason}` : '';
+        });
       }
     }
     for (const tgt of S.graph.targets) {
       document.querySelectorAll(`[data-tree-dot="tgt:${tgt.name}"]`).forEach(d => {
         d.className = `dot ${stateDotClass(targetState(tgt.name))}`;
+      });
+      const ts = targetState(tgt.name);
+      const tgtReason = S.targets[tgt.name]?.reason;
+      document.querySelectorAll(`[data-tree-reason="tgt:${tgt.name}"]`).forEach(el => {
+        el.textContent = (ts !== 'green' && tgtReason) ? ` \u2014 ${tgtReason}` : '';
       });
     }
   },
@@ -1463,6 +1501,16 @@ const Interaction = {
         this.depForward[key] = (probe.depends_on || []).slice();
         for (const dep of (probe.depends_on || [])) {
           (this.depReverse[dep] = this.depReverse[dep] || []).push(key);
+        }
+      }
+      // Include start_after relationships: all probes in this service
+      // logically depend on the start_after probes for highlighting
+      for (const saProbe of (svc.start_after || [])) {
+        for (const probe of svc.probes) {
+          const key = `${svc.name}.${probe.name}`;
+          if (!this.depForward[key]) this.depForward[key] = [];
+          this.depForward[key].push(saProbe);
+          (this.depReverse[saProbe] = this.depReverse[saProbe] || []).push(key);
         }
       }
     }
@@ -1812,7 +1860,7 @@ const WS = {
     for (const [name, data] of Object.entries(msg.services || {})) {
       S.services[name] = { state: data.state, probes: {} };
       for (const [probeName, cdata] of Object.entries(data.probes || {})) {
-        S.services[name].probes[probeName] = { state: cdata.state };
+        S.services[name].probes[probeName] = { state: cdata.state, reason: cdata.reason || null };
       }
     }
     // Merge target states
@@ -1834,10 +1882,11 @@ const WS = {
           S.services[parts[0]].probes[parts[1]] = {};
         }
         S.services[parts[0]].probes[parts[1]].state = ev.data.display_state || ev.data.state;
+        S.services[parts[0]].probes[parts[1]].reason = ev.data.reason || null;
       }
     } else if (ev.category === 'target' && ev.data) {
       const tgt = ev.data.target;
-      if (tgt) S.targets[tgt] = { state: ev.data.state };
+      if (tgt) S.targets[tgt] = { state: ev.data.state, reason: ev.data.reason || null };
     }
 
     // Probe activity: probe event with attempt=0 means "probe started", flash that probe's dot
@@ -1946,13 +1995,13 @@ async function init() {
       }
       for (const probe of svc.probes) {
         if (!S.services[svc.name].probes[probe.name]) {
-          S.services[svc.name].probes[probe.name] = { state: probe.state };
+          S.services[svc.name].probes[probe.name] = { state: probe.state, reason: probe.reason || null };
         }
       }
     }
     for (const tgt of graph.targets) {
       if (!S.targets[tgt.name]) {
-        S.targets[tgt.name] = { state: tgt.state };
+        S.targets[tgt.name] = { state: tgt.state, reason: tgt.reason || null };
       }
     }
 

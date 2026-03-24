@@ -8,6 +8,7 @@ Uses demo fixture (6 services):
   fast-heal               — reconnects in ~2s (restart_on_fail: false)
 """
 
+import os
 import subprocess
 import time
 
@@ -135,10 +136,14 @@ def test_reprobe_self_healing(demo):
     """Reprobe: fast-heal self-heals, stuck-svc stays broken."""
     demo.ensure_green()
     demo.stop('postgres')
+    # Wait for propagation + actual container detection.
+    # Propagation makes probes Red instantly, but stuck-svc's monitoring
+    # loop (every 2s) must also detect and log "dependency check failed"
+    # for the reprobe log scan to find it.
     demo.wait_probe_state('fast-heal.http', 'red', timeout=15)
-    time.sleep(8)
+    time.sleep(10)
 
-    demo.start('postgres')
+    demo.start('postgres', timeout=30)
     demo.wait_probe_state('postgres.ready', 'green', timeout=30)
     time.sleep(3)
 
@@ -188,3 +193,68 @@ def test_probe_results_have_logs(demo):
     assert len(log_probes) > 0, "No log probes with matched lines"
     tcp_probes = [k for k, v in d.get('probes', {}).items() if v.get('probe_ms') is not None]
     assert len(tcp_probes) > 0, "No probes with timing"
+
+
+@slow
+def test_probe_propagation(demo):
+    """Stop redis → probes that depend on redis go red immediately."""
+    demo.ensure_green()
+    demo.stop('redis')
+
+    # Dependency chain:
+    #   redis.ready → crash-svc.dep → crash-svc.http
+    #   redis.ready → slow-heal.dep → slow-heal.http
+    # All should be red now, without waiting for probes to time out.
+    _, _, _, probes = demo.graph_full()
+    assert probes['crash-svc.dep'] == 'red'
+    assert probes['crash-svc.http'] == 'red'
+    assert probes['slow-heal.dep'] == 'red'
+    assert probes['slow-heal.http'] == 'red'
+
+
+@slow
+def test_probe_propagation_external_kill(demo):
+    """Docker kill redis externally → same propagation via watcher."""
+    demo.ensure_green()
+    subprocess.run(['docker', 'kill', 'demo-redis'], capture_output=True, timeout=5)
+
+    # Watcher detects the kill and propagates within seconds (not probe timeout).
+    assert demo.wait_probe_state('crash-svc.dep', 'red', timeout=5), \
+        f"crash-svc.dep not red: {demo.graph_full()[3]}"
+
+    _, _, _, probes = demo.graph_full()
+    assert probes['slow-heal.dep'] in ('red', 'stopped')
+
+
+@slow
+def test_converge_reports_start_failure(demo):
+    """Container removed → converge reports which service failed and why."""
+    demo.ensure_green()
+
+    # Stop all, then remove redis container so docker can't start it
+    for svc in ('crash-svc', 'slow-heal', 'redis'):
+        demo.stop(svc)
+    demo.wait_svc_state('redis', 'stopped', timeout=10)
+    subprocess.run(
+        ['docker', 'rm', '-f', 'demo-redis'], capture_output=True, timeout=10)
+
+    try:
+        d = demo.converge(timeout=30)
+        assert d['result'] == 'failed'
+
+        # Should finish fast (not burn the full 30s timeout)
+        assert d['duration_ms'] < 15000, \
+            f"converge took {d['duration_ms']}ms — should bail early on start failure"
+
+        # Error should name the failing service
+        assert 'redis' in d.get('error', ''), \
+            f"error doesn't mention redis: {d.get('error')}"
+        assert 'start_errors' in d.get('actions', {}), \
+            f"no start_errors in actions: {d.get('actions')}"
+        assert 'redis' in d['actions']['start_errors']
+    finally:
+        # Recreate the container so other tests still work
+        subprocess.run(
+            ['docker', 'compose', 'up', '--no-start', 'redis'],
+            capture_output=True, timeout=30,
+            cwd=os.path.join(os.path.dirname(__file__), 'fixtures', 'demo'))

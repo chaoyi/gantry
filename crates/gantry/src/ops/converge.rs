@@ -7,10 +7,10 @@ use futures::StreamExt;
 use crate::api::AppState;
 use crate::error::{GantryError, Result};
 use crate::events::Event;
-use crate::model::{ProbeRef, ProbeState, ServiceState};
+use crate::model::{ProbeRef, ServiceState};
 use crate::ops::{
-    OpActions, OpResponse, ProbeStatus, collect_stale_or_red_probes, emit_svc_display_states,
-    emit_target_states,
+    OpActions, OpResponse, ProbeStatus, collect_stale_or_red_probes, collect_stale_probes,
+    emit_svc_display_states, emit_target_states,
 };
 
 pub async fn converge(
@@ -99,11 +99,22 @@ pub async fn converge(
         result: result_str.to_string(),
         duration_ms,
         error: if result_str == "failed" {
-            Some(if timed_out {
-                "timeout".into()
-            } else {
-                "target not ready".into()
-            })
+            let mut parts = Vec::new();
+            if timed_out {
+                parts.push("timeout".to_string());
+            }
+            if !actions.start_errors.is_empty() {
+                let details: Vec<String> = actions
+                    .start_errors
+                    .iter()
+                    .map(|(svc, err)| format!("{svc}: {err}"))
+                    .collect();
+                parts.push(format!("failed to start: {}", details.join("; ")));
+            }
+            if parts.is_empty() {
+                parts.push("target not ready".to_string());
+            }
+            Some(parts.join("; "))
         } else {
             None
         },
@@ -133,8 +144,20 @@ async fn converge_loop(
         if remaining.is_zero() {
             break;
         }
+        let started_before = actions.started.len();
+        let restarted_before = actions.restarted.len();
 
-        // Step 1: Start any stopped services (cascade via start_after, parallel)
+        // Step 1: Refresh — single-probe stale probes on already-running services so that
+        // start_after deps can be evaluated (e.g. after external docker restart).
+        {
+            let remaining = timeout.saturating_sub(start_time.elapsed());
+            let stale = collect_stale_probes(state, Some(transitive_probes)).await;
+            if !stale.is_empty() {
+                super::probe_and_resolve(state, &stale, probe_statuses, remaining).await;
+            }
+        }
+
+        // Step 2: Start stopped services (cascade via start_after, parallel)
         let to_start: Vec<(String, Vec<ProbeRef>)> = {
             let services = state.services.read().await;
             needed_services
@@ -149,23 +172,48 @@ async fn converge_loop(
 
         if !to_start.is_empty() {
             let remaining = timeout.saturating_sub(start_time.elapsed());
+            // Shared set: when a start fails, other futures waiting on that
+            // service's probes can bail early instead of polling until timeout.
+            let failed_starts: Arc<tokio::sync::Mutex<HashSet<String>>> =
+                Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+
             let mut futs = futures::stream::FuturesUnordered::new();
             for (svc_name, start_after_deps) in to_start {
                 let state = state.clone();
+                let failed_starts = failed_starts.clone();
                 futs.push(async move {
                     let deadline = Instant::now() + remaining;
+                    let mut unmet_dep: Option<String> = None;
                     for dep in &start_after_deps {
+                        let mut met = false;
                         while Instant::now() < deadline {
                             let services = state.services.read().await;
                             if let Some(svc) = services.get(&dep.service)
                                 && let Some(probe) = svc.probes.get(&dep.probe)
-                                && probe.state == ProbeState::Green
+                                && probe.state.is_green()
                             {
+                                met = true;
                                 break;
                             }
                             drop(services);
+                            // Bail early if dep service failed to start
+                            if failed_starts.lock().await.contains(&dep.service) {
+                                break;
+                            }
                             tokio::time::sleep(Duration::from_millis(50)).await;
                         }
+                        if !met {
+                            unmet_dep = Some(dep.to_string());
+                            break;
+                        }
+                    }
+                    if let Some(dep) = unmet_dep {
+                        return (
+                            svc_name,
+                            Err(crate::error::GantryError::Operation(format!(
+                                "dependency {dep} not satisfied"
+                            ))),
+                        );
                     }
                     if start_after_deps.is_empty() {
                         tracing::info!("[{svc_name}] starting");
@@ -175,7 +223,7 @@ async fn converge_loop(
                         tracing::info!("[{svc_name}] starting (after {})", deps.join(", "));
                     }
                     let remaining = deadline.saturating_duration_since(Instant::now());
-                    let result = super::start::start(&state, &svc_name, remaining).await;
+                    let result = super::start::start(&state, &svc_name, remaining, false).await;
                     (svc_name, result)
                 });
             }
@@ -191,12 +239,17 @@ async fn converge_loop(
                     }
                     Err(e) => {
                         tracing::warn!("converge: failed to start {svc_name}: {e}");
+                        failed_starts.lock().await.insert(svc_name.clone());
+                        actions.start_errors.insert(svc_name.clone(), e.to_string());
                     }
                 }
             }
         }
 
-        // Step 2: Long-probe stale+red probes AND restart fast-failing services.
+        let just_started: HashSet<String> =
+            actions.started[started_before..].iter().cloned().collect();
+
+        // Step 3: Probe stale/red probes AND restart fast-failing services.
         // Probes run in parallel. As each completes, we check if the service
         // should be restarted — no waiting for slow probes to finish first.
         {
@@ -256,7 +309,11 @@ async fn converge_loop(
 
                 if let Some(count) = pending_per_svc.get_mut(&pr.service) {
                     *count = count.saturating_sub(1);
-                    if probe_failed && allow_restart && !restarted.contains(&pr.service) {
+                    if probe_failed
+                        && allow_restart
+                        && !restarted.contains(&pr.service)
+                        && !just_started.contains(&pr.service)
+                    {
                         // Apply results so far to update state
                         if !batch_results.is_empty() {
                             crate::ops::resolve_probe_batch(state, &batch_results, probe_statuses)
@@ -269,7 +326,7 @@ async fn converge_loop(
                             if let Some(svc) = services.get(&pr.service) {
                                 svc.restart_on_fail
                                     && svc.state == ServiceState::Running
-                                    && svc.probes.values().any(|p| p.state == ProbeState::Red)
+                                    && svc.probes.values().any(|p| p.state.is_red())
                             } else {
                                 false
                             }
@@ -316,14 +373,14 @@ async fn converge_loop(
             }
         }
 
-        // Check: all green? Done.
+        // Step 4: Check completion — all green? Done.
         let all_green = {
             let services = state.services.read().await;
             transitive_probes.iter().all(|pr| {
                 services
                     .get(&pr.service)
                     .and_then(|s| s.probes.get(&pr.probe))
-                    .is_some_and(|p| p.state == ProbeState::Green)
+                    .is_some_and(|p| p.state.is_green())
             })
         };
         if all_green || !allow_restart {
@@ -339,6 +396,13 @@ async fn converge_loop(
         };
         if !has_stopped {
             break; // nothing to restart, done
+        }
+
+        // No progress? Break to avoid spinning forever (e.g. container can't start).
+        let made_progress =
+            actions.started.len() > started_before || actions.restarted.len() > restarted_before;
+        if !made_progress {
+            break;
         }
         // Loop back: step 1 will start the stopped services
     }

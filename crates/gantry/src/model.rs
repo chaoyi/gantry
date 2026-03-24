@@ -30,21 +30,96 @@ impl fmt::Display for ServiceState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "lowercase", tag = "state")]
 pub enum ProbeState {
     Green,
-    Red,
-    Stale,
+    Red(RedReason),
+    Stale(StaleReason),
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case", tag = "reason")]
+pub enum RedReason {
+    ProbeFailed(ProbeFailure),
+    DepRed { dep: ProbeRef },
+    Stopped,
+    ContainerDied,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case", tag = "reason")]
+pub enum StaleReason {
+    DepRecovered { dep: ProbeRef },
+    DepNotReady { dep: ProbeRef },
+    ContainerStarted,
+    Reprobing,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProbeFailure {
+    pub error: String,
+    pub duration_ms: u64,
+}
+
+impl RedReason {
+    pub fn display(&self) -> String {
+        match self {
+            Self::ProbeFailed(f) => format!("probe failed: {} ({}ms)", f.error, f.duration_ms),
+            Self::DepRed { dep } => format!("dep red: {dep}"),
+            Self::Stopped => "stopped".into(),
+            Self::ContainerDied => "container died".into(),
+        }
+    }
+}
+
+impl StaleReason {
+    pub fn display(&self) -> String {
+        match self {
+            Self::DepRecovered { dep } => format!("dep {dep} recovered"),
+            Self::DepNotReady { dep } => format!("dep {dep} not ready"),
+            Self::ContainerStarted => "container started externally".into(),
+            Self::Reprobing => "reprobing".into(),
+        }
+    }
 }
 
 impl ProbeState {
+    /// Human-readable reason string for non-Green states.
+    pub fn reason(&self) -> Option<String> {
+        match self {
+            Self::Green => None,
+            Self::Red(r) => Some(r.display()),
+            Self::Stale(r) => Some(r.display()),
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Green => "green",
-            Self::Red => "red",
-            Self::Stale => "stale",
+            Self::Red(_) => "red",
+            Self::Stale(_) => "stale",
         }
+    }
+
+    pub fn color(&self) -> ProbeColor {
+        match self {
+            Self::Green => ProbeColor::Green,
+            Self::Red(_) => ProbeColor::Red,
+            Self::Stale(_) => ProbeColor::Stale,
+        }
+    }
+
+    pub fn is_green(&self) -> bool {
+        matches!(self, Self::Green)
+    }
+
+    pub fn is_red(&self) -> bool {
+        matches!(self, Self::Red(_))
+    }
+
+    pub fn is_stale(&self) -> bool {
+        matches!(self, Self::Stale(_))
     }
 }
 
@@ -56,21 +131,57 @@ impl fmt::Display for ProbeState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub enum TargetState {
+pub enum ProbeColor {
     Green,
     Red,
     Stale,
-    Stopped,
+}
+
+impl ProbeColor {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Green => "green",
+            Self::Red => "red",
+            Self::Stale => "stale",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub enum TargetState {
+    Green,
+    Red(TargetRedReason),
+    Stale { probe: ProbeRef },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub enum TargetRedReason {
+    ProbeRed { probe: ProbeRef },
+    ServiceStopped { service: String },
 }
 
 impl TargetState {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Green => "green",
-            Self::Red => "red",
-            Self::Stale => "stale",
-            Self::Stopped => "stopped",
+            Self::Red(_) => "red",
+            Self::Stale { .. } => "stale",
         }
+    }
+
+    pub fn reason(&self) -> Option<String> {
+        match self {
+            Self::Green => None,
+            Self::Red(TargetRedReason::ProbeRed { probe }) => Some(format!("probe red: {probe}")),
+            Self::Red(TargetRedReason::ServiceStopped { service }) => {
+                Some(format!("service stopped: {service}"))
+            }
+            Self::Stale { probe } => Some(format!("probe stale: {probe}")),
+        }
+    }
+
+    pub fn is_green(&self) -> bool {
+        matches!(self, Self::Green)
     }
 }
 
@@ -105,10 +216,10 @@ impl ProbeDisplayState {
     pub fn from_probe(probe: &ProbeRuntime, svc_state: ServiceState) -> Self {
         match svc_state {
             ServiceState::Stopped => Self::Stopped,
-            _ => match probe.state {
+            _ => match &probe.state {
                 ProbeState::Green => Self::Green,
-                ProbeState::Red => Self::Red,
-                ProbeState::Stale => Self::Stale,
+                ProbeState::Red(_) => Self::Red,
+                ProbeState::Stale(_) => Self::Stale,
             },
         }
     }
@@ -142,9 +253,9 @@ impl SvcDisplayState {
                 let mut has_red = false;
                 let mut has_stale = false;
                 for probe in svc.probes.values() {
-                    match probe.state {
-                        ProbeState::Red => has_red = true,
-                        ProbeState::Stale => has_stale = true,
+                    match &probe.state {
+                        ProbeState::Red(_) => has_red = true,
+                        ProbeState::Stale(_) => has_stale = true,
                         ProbeState::Green => {}
                     }
                 }
@@ -205,7 +316,7 @@ pub struct ServiceRuntime {
 pub struct ProbeRuntime {
     pub probe_ref: ProbeRef,
     pub state: ProbeState,
-    pub prev_state: Option<ProbeState>,
+    pub prev_color: Option<ProbeColor>,
     pub probe_config: ProbeConfig,
     pub depends_on: Vec<ProbeRef>,
     pub last_probe_ms: Option<u64>,
@@ -224,25 +335,39 @@ pub struct TargetRuntime {
 impl TargetRuntime {
     /// Target state derived from transitive probes + service states.
     pub fn state(&self, services: &IndexMap<String, ServiceRuntime>) -> TargetState {
-        let mut has_stale = false;
+        let mut first_stale: Option<ProbeRef> = None;
         for probe_ref in &self.transitive_probes {
             let Some(svc) = services.get(&probe_ref.service) else {
-                return TargetState::Red;
+                return TargetState::Red(TargetRedReason::ProbeRed {
+                    probe: probe_ref.clone(),
+                });
             };
             if svc.state == ServiceState::Stopped {
-                return TargetState::Red; // service down = target unsatisfied
+                return TargetState::Red(TargetRedReason::ServiceStopped {
+                    service: probe_ref.service.clone(),
+                });
             }
             let Some(probe) = svc.probes.get(&probe_ref.probe) else {
-                return TargetState::Red;
+                return TargetState::Red(TargetRedReason::ProbeRed {
+                    probe: probe_ref.clone(),
+                });
             };
-            match probe.state {
-                ProbeState::Red => return TargetState::Red,
-                ProbeState::Stale => has_stale = true,
+            match &probe.state {
+                ProbeState::Red(_) => {
+                    return TargetState::Red(TargetRedReason::ProbeRed {
+                        probe: probe_ref.clone(),
+                    });
+                }
+                ProbeState::Stale(_) => {
+                    if first_stale.is_none() {
+                        first_stale = Some(probe_ref.clone());
+                    }
+                }
                 ProbeState::Green => {}
             }
         }
-        if has_stale {
-            TargetState::Stale
+        if let Some(probe) = first_stale {
+            TargetState::Stale { probe }
         } else {
             TargetState::Green
         }
@@ -269,8 +394,8 @@ impl RuntimeState {
                     probe_name.clone(),
                     ProbeRuntime {
                         probe_ref: ProbeRef::new(svc_name, probe_name),
-                        state: ProbeState::Red,
-                        prev_state: None,
+                        state: ProbeState::Red(RedReason::Stopped),
+                        prev_color: None,
                         probe_config: probe_config.probe.clone(),
                         depends_on,
                         last_probe_ms: None,
@@ -345,7 +470,7 @@ mod tests {
         ProbeRuntime {
             probe_ref: ProbeRef::new("test", "probe"),
             state,
-            prev_state: None,
+            prev_color: None,
             probe_config: crate::config::ProbeConfig::Meta,
             depends_on: vec![],
             last_probe_ms: None,
@@ -373,7 +498,7 @@ mod tests {
 
     #[test]
     fn probe_display_running_red() {
-        let probe = make_probe(ProbeState::Red);
+        let probe = make_probe(ProbeState::Red(RedReason::Stopped));
         assert!(matches!(
             ProbeDisplayState::from_probe(&probe, ServiceState::Running),
             ProbeDisplayState::Red
@@ -382,7 +507,7 @@ mod tests {
 
     #[test]
     fn probe_display_running_stale() {
-        let probe = make_probe(ProbeState::Stale);
+        let probe = make_probe(ProbeState::Stale(StaleReason::Reprobing));
         assert!(matches!(
             ProbeDisplayState::from_probe(&probe, ServiceState::Running),
             ProbeDisplayState::Stale
@@ -398,8 +523,8 @@ mod tests {
                 format!("probe{i}"),
                 ProbeRuntime {
                     probe_ref: ProbeRef::new("test", &format!("probe{i}")),
-                    state: *ps,
-                    prev_state: None,
+                    state: ps.clone(),
+                    prev_color: None,
                     probe_config: crate::config::ProbeConfig::Meta,
                     depends_on: vec![],
                     last_probe_ms: None,
@@ -422,7 +547,10 @@ mod tests {
 
     #[test]
     fn svc_display_stopped() {
-        let svc = make_svc(ServiceState::Stopped, &[ProbeState::Red]);
+        let svc = make_svc(
+            ServiceState::Stopped,
+            &[ProbeState::Red(RedReason::Stopped)],
+        );
         assert!(matches!(
             SvcDisplayState::from_service(&svc),
             SvcDisplayState::Stopped
@@ -452,7 +580,10 @@ mod tests {
 
     #[test]
     fn svc_display_any_red() {
-        let svc = make_svc(ServiceState::Running, &[ProbeState::Green, ProbeState::Red]);
+        let svc = make_svc(
+            ServiceState::Running,
+            &[ProbeState::Green, ProbeState::Red(RedReason::Stopped)],
+        );
         assert!(matches!(
             SvcDisplayState::from_service(&svc),
             SvcDisplayState::Red
@@ -461,7 +592,13 @@ mod tests {
 
     #[test]
     fn svc_display_stale_priority_over_red() {
-        let svc = make_svc(ServiceState::Running, &[ProbeState::Stale, ProbeState::Red]);
+        let svc = make_svc(
+            ServiceState::Running,
+            &[
+                ProbeState::Stale(StaleReason::Reprobing),
+                ProbeState::Red(RedReason::Stopped),
+            ],
+        );
         assert!(matches!(
             SvcDisplayState::from_service(&svc),
             SvcDisplayState::Stale
@@ -472,7 +609,7 @@ mod tests {
     fn svc_display_stale_only() {
         let svc = make_svc(
             ServiceState::Running,
-            &[ProbeState::Green, ProbeState::Stale],
+            &[ProbeState::Green, ProbeState::Stale(StaleReason::Reprobing)],
         );
         assert!(matches!(
             SvcDisplayState::from_service(&svc),
@@ -502,10 +639,7 @@ targets:
         for probe in db.probes.values_mut() {
             probe.state = ProbeState::Green;
         }
-        assert_eq!(
-            state.targets["t"].state(&state.services),
-            TargetState::Green
-        );
+        assert!(state.targets["t"].state(&state.services).is_green());
     }
 
     #[test]
@@ -524,7 +658,10 @@ targets:
         let config: crate::config::GantryConfig = serde_yaml::from_str(yaml).unwrap();
         let state = RuntimeState::from_config(&config);
         // db is Stopped by default
-        assert_eq!(state.targets["t"].state(&state.services), TargetState::Red);
+        assert!(matches!(
+            state.targets["t"].state(&state.services),
+            TargetState::Red(TargetRedReason::ServiceStopped { .. })
+        ));
     }
 
     #[test]
@@ -550,10 +687,10 @@ targets:
             .probes
             .get_mut("port")
             .unwrap()
-            .state = ProbeState::Stale;
-        assert_eq!(
+            .state = ProbeState::Stale(StaleReason::Reprobing);
+        assert!(matches!(
             state.targets["t"].state(&state.services),
-            TargetState::Stale
-        );
+            TargetState::Stale { .. }
+        ));
     }
 }
