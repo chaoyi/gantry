@@ -92,7 +92,11 @@ async fn build_snapshot(state: &AppState) -> serde_json::Value {
     let mut tgt_states = serde_json::Map::new();
     for (name, tgt) in targets.iter() {
         let s = tgt.state(&services);
-        tgt_states.insert(name.clone(), serde_json::json!({ "state": s.as_str() }));
+        let mut tgt_json = serde_json::json!({ "state": s.as_str() });
+        if let Some(reason) = s.reason() {
+            tgt_json["reason"] = serde_json::json!(reason);
+        }
+        tgt_states.insert(name.clone(), tgt_json);
     }
 
     serde_json::json!({

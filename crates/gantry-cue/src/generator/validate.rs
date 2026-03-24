@@ -67,6 +67,8 @@ mod tests {
             services: IndexMap::new(),
             targets: IndexMap::new(),
             defaults: None,
+            files: vec![],
+            volumes: IndexMap::new(),
         }
     }
 
@@ -97,8 +99,22 @@ mod tests {
                 },
                 env: IndexMap::new(),
                 ports: vec![],
+                volumes: vec![],
+                command: None,
+                entrypoint: None,
+                user: None,
+                working_dir: None,
+                hostname: None,
+                cap_add: vec![],
+                cap_drop: vec![],
+                privileged: None,
+                labels: IndexMap::new(),
+                extra_hosts: vec![],
+                init: None,
+                stop_grace_period: None,
                 files: vec![],
                 start_after: vec![],
+                restart_on_fail: None,
                 probes: IndexMap::new(),
             },
         );
@@ -106,6 +122,8 @@ mod tests {
             services,
             targets: IndexMap::new(),
             defaults: None,
+            files: vec![],
+            volumes: IndexMap::new(),
         };
 
         let err = validate(&setup, &tmp).unwrap_err();
@@ -127,6 +145,19 @@ mod tests {
                 image: ImageDef::Prebuilt("nginx".into()),
                 env: IndexMap::new(),
                 ports: vec![],
+                volumes: vec![],
+                command: None,
+                entrypoint: None,
+                user: None,
+                working_dir: None,
+                hostname: None,
+                cap_add: vec![],
+                cap_drop: vec![],
+                privileged: None,
+                labels: IndexMap::new(),
+                extra_hosts: vec![],
+                init: None,
+                stop_grace_period: None,
                 files: vec![FileDef {
                     src: "nonexistent.toml".into(),
                     dst: "config.toml".into(),
@@ -134,6 +165,7 @@ mod tests {
                     context: None,
                 }],
                 start_after: vec![],
+                restart_on_fail: None,
                 probes: IndexMap::new(),
             },
         );
@@ -141,6 +173,8 @@ mod tests {
             services,
             targets: IndexMap::new(),
             defaults: None,
+            files: vec![],
+            volumes: IndexMap::new(),
         };
 
         let err = validate(&setup, &tmp).unwrap_err();
@@ -167,6 +201,19 @@ mod tests {
                 },
                 env: IndexMap::new(),
                 ports: vec![],
+                volumes: vec![],
+                command: None,
+                entrypoint: None,
+                user: None,
+                working_dir: None,
+                hostname: None,
+                cap_add: vec![],
+                cap_drop: vec![],
+                privileged: None,
+                labels: IndexMap::new(),
+                extra_hosts: vec![],
+                init: None,
+                stop_grace_period: None,
                 files: vec![
                     FileDef {
                         src: "missing1.txt".into(),
@@ -182,6 +229,7 @@ mod tests {
                     },
                 ],
                 start_after: vec![],
+                restart_on_fail: None,
                 probes: IndexMap::new(),
             },
         );
@@ -189,6 +237,8 @@ mod tests {
             services,
             targets: IndexMap::new(),
             defaults: None,
+            files: vec![],
+            volumes: IndexMap::new(),
         };
 
         let err = validate(&setup, &tmp).unwrap_err();
@@ -219,6 +269,19 @@ mod tests {
                 },
                 env: IndexMap::new(),
                 ports: vec![],
+                volumes: vec![],
+                command: None,
+                entrypoint: None,
+                user: None,
+                working_dir: None,
+                hostname: None,
+                cap_add: vec![],
+                cap_drop: vec![],
+                privileged: None,
+                labels: IndexMap::new(),
+                extra_hosts: vec![],
+                init: None,
+                stop_grace_period: None,
                 files: vec![
                     FileDef {
                         src: "config.tmpl".into(),
@@ -234,6 +297,7 @@ mod tests {
                     },
                 ],
                 start_after: vec![],
+                restart_on_fail: None,
                 probes: IndexMap::new(),
             },
         );
@@ -241,6 +305,8 @@ mod tests {
             services,
             targets: IndexMap::new(),
             defaults: None,
+            files: vec![],
+            volumes: IndexMap::new(),
         };
 
         assert!(validate(&setup, &tmp).is_ok());

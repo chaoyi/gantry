@@ -3,11 +3,17 @@ use serde::Serialize;
 
 use crate::error::Result;
 
-use super::schema::{ImageDef, SetupJson};
+use super::schema::{ImageDef, SetupJson, VolumeConfig};
+
+fn is_false(v: &bool) -> bool {
+    !v
+}
 
 #[derive(Debug, Serialize)]
 struct ComposeFile {
     services: IndexMap<String, ComposeService>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    volumes: Option<IndexMap<String, VolumeConfig>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -19,13 +25,35 @@ struct ComposeService {
     #[serde(skip_serializing_if = "Option::is_none")]
     command: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    entrypoint: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     container_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hostname: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     environment: Option<IndexMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ports: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     volumes: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    cap_add: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    cap_drop: Vec<String>,
+    #[serde(skip_serializing_if = "is_false")]
+    privileged: bool,
+    #[serde(skip_serializing_if = "IndexMap::is_empty")]
+    labels: IndexMap<String, String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    extra_hosts: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    init: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop_grace_period: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -45,13 +73,24 @@ pub fn generate_compose(setup: &SetupJson, setup_name: &str) -> Result<String> {
             image: Some("ghcr.io/chaoyi/gantry:latest".to_string()),
             build: None,
             command: None,
+            entrypoint: None,
             container_name: Some(format!("{setup_name}-gantry")),
+            user: None,
+            working_dir: None,
+            hostname: None,
             environment: None,
             ports: Some(vec!["9090:9090".to_string()]),
             volumes: Some(vec![
                 "/var/run/docker.sock:/var/run/docker.sock".to_string(),
                 "./gantry.yaml:/etc/gantry/config.yaml:ro".to_string(),
             ]),
+            cap_add: Vec::new(),
+            cap_drop: Vec::new(),
+            privileged: false,
+            labels: IndexMap::new(),
+            extra_hosts: Vec::new(),
+            init: None,
+            stop_grace_period: None,
         },
     );
 
@@ -80,7 +119,11 @@ pub fn generate_compose(setup: &SetupJson, setup_name: &str) -> Result<String> {
                 image,
                 build,
                 command: svc_def.command.clone(),
+                entrypoint: svc_def.entrypoint.clone(),
                 container_name: Some(format!("{setup_name}-{svc_name}")),
+                user: svc_def.user.clone(),
+                working_dir: svc_def.working_dir.clone(),
+                hostname: svc_def.hostname.clone(),
                 environment,
                 ports: if svc_def.ports.is_empty() {
                     None
@@ -92,11 +135,27 @@ pub fn generate_compose(setup: &SetupJson, setup_name: &str) -> Result<String> {
                 } else {
                     Some(svc_def.volumes.clone())
                 },
+                cap_add: svc_def.cap_add.clone(),
+                cap_drop: svc_def.cap_drop.clone(),
+                privileged: svc_def.privileged.unwrap_or(false),
+                labels: svc_def.labels.clone(),
+                extra_hosts: svc_def.extra_hosts.clone(),
+                init: svc_def.init,
+                stop_grace_period: svc_def.stop_grace_period.clone(),
             },
         );
     }
 
-    let compose = ComposeFile { services };
+    let top_volumes = if setup.volumes.is_empty() {
+        None
+    } else {
+        Some(setup.volumes.clone())
+    };
+
+    let compose = ComposeFile {
+        services,
+        volumes: top_volumes,
+    };
     Ok(serde_yaml::to_string(&compose)?)
 }
 
@@ -219,5 +278,104 @@ mod tests {
         assert!(!yaml.contains("8080:8080"));
         // Only gantry gets host-mapped ports for the UI
         assert!(yaml.contains("9090:9090"));
+    }
+
+    #[test]
+    fn new_compose_fields_pass_through() {
+        let json = r#"{
+          "services": {
+            "vpn": {
+              "image": "wireguard:latest",
+              "entrypoint": ["/init.sh", "--start"],
+              "user": "1000:1000",
+              "working_dir": "/app",
+              "hostname": "vpn-node",
+              "cap_add": ["NET_ADMIN"],
+              "cap_drop": ["ALL"],
+              "privileged": true,
+              "labels": {"com.example.env": "dev"},
+              "extra_hosts": ["host.docker.internal:host-gateway"],
+              "init": true,
+              "stop_grace_period": "30s",
+              "probes": {}
+            }
+          },
+          "volumes": {
+            "pgdata": {"driver": "local"},
+            "cache": {}
+          }
+        }"#;
+        let setup: crate::generator::schema::SetupJson = serde_json::from_str(json).unwrap();
+        let yaml = generate_compose(&setup, "test").unwrap();
+
+        // Verify new fields appear in output
+        assert!(yaml.contains("entrypoint:"), "missing entrypoint");
+        assert!(
+            yaml.contains("user:") && yaml.contains("1000:1000"),
+            "missing user, yaml:\n{yaml}"
+        );
+        assert!(yaml.contains("working_dir: /app"), "missing working_dir");
+        assert!(yaml.contains("hostname: vpn-node"), "missing hostname");
+        assert!(yaml.contains("cap_add:"), "missing cap_add");
+        assert!(yaml.contains("NET_ADMIN"), "missing NET_ADMIN in cap_add");
+        assert!(yaml.contains("cap_drop:"), "missing cap_drop");
+        assert!(yaml.contains("privileged: true"), "missing privileged");
+        assert!(yaml.contains("com.example.env"), "missing labels");
+        assert!(yaml.contains("extra_hosts:"), "missing extra_hosts");
+        assert!(
+            yaml.contains("host.docker.internal:host-gateway"),
+            "missing extra_hosts entry"
+        );
+        assert!(yaml.contains("init: true"), "missing init");
+        assert!(
+            yaml.contains("stop_grace_period:"),
+            "missing stop_grace_period"
+        );
+
+        // Top-level volumes
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let vols = parsed["volumes"].as_mapping().unwrap();
+        assert_eq!(vols.len(), 2);
+    }
+
+    #[test]
+    fn new_fields_omitted_when_empty() {
+        // Existing sample_json has none of the new fields — they should not appear
+        let setup: crate::generator::schema::SetupJson =
+            serde_json::from_str(sample_json()).unwrap();
+        let yaml = generate_compose(&setup, "demo").unwrap();
+
+        assert!(
+            !yaml.contains("entrypoint:"),
+            "entrypoint should be omitted"
+        );
+        assert!(!yaml.contains("user:"), "user should be omitted");
+        assert!(
+            !yaml.contains("working_dir:"),
+            "working_dir should be omitted"
+        );
+        assert!(!yaml.contains("hostname:"), "hostname should be omitted");
+        assert!(!yaml.contains("cap_add:"), "cap_add should be omitted");
+        assert!(!yaml.contains("cap_drop:"), "cap_drop should be omitted");
+        assert!(
+            !yaml.contains("privileged:"),
+            "privileged should be omitted"
+        );
+        assert!(!yaml.contains("labels:"), "labels should be omitted");
+        assert!(
+            !yaml.contains("extra_hosts:"),
+            "extra_hosts should be omitted"
+        );
+        assert!(!yaml.contains("init:"), "init should be omitted");
+        assert!(
+            !yaml.contains("stop_grace_period:"),
+            "stop_grace_period should be omitted"
+        );
+        // No top-level volumes key
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        assert!(
+            parsed["volumes"].is_null(),
+            "top-level volumes should be omitted"
+        );
     }
 }

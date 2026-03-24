@@ -1,5 +1,5 @@
 use indexmap::IndexMap;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Top-level JSON from `cue export`.
@@ -12,6 +12,15 @@ pub struct SetupJson {
     pub defaults: Option<DefaultsDef>,
     #[serde(default)]
     pub files: Vec<FileDef>,
+    #[serde(default)]
+    pub volumes: IndexMap<String, VolumeConfig>,
+}
+
+/// Named volume configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VolumeConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
 }
 
 /// A service definition from the CUE export.
@@ -29,6 +38,28 @@ pub struct ServiceDef {
     pub volumes: Vec<String>,
     #[serde(default)]
     pub command: Option<serde_json::Value>,
+    #[serde(default)]
+    pub entrypoint: Option<serde_json::Value>,
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub working_dir: Option<String>,
+    #[serde(default)]
+    pub hostname: Option<String>,
+    #[serde(default)]
+    pub cap_add: Vec<String>,
+    #[serde(default)]
+    pub cap_drop: Vec<String>,
+    #[serde(default)]
+    pub privileged: Option<bool>,
+    #[serde(default)]
+    pub labels: IndexMap<String, String>,
+    #[serde(default)]
+    pub extra_hosts: Vec<String>,
+    #[serde(default)]
+    pub init: Option<bool>,
+    #[serde(default)]
+    pub stop_grace_period: Option<String>,
     #[serde(default)]
     pub files: Vec<FileDef>,
     #[serde(default)]
@@ -249,5 +280,71 @@ mod tests {
         assert!(setup.services.is_empty());
         assert!(setup.targets.is_empty());
         assert!(setup.defaults.is_none());
+        assert!(setup.volumes.is_empty());
+    }
+
+    #[test]
+    fn parse_new_compose_fields() {
+        let json = r#"{
+          "services": {
+            "vpn": {
+              "image": "wireguard:latest",
+              "entrypoint": "/init.sh",
+              "user": "1000:1000",
+              "working_dir": "/app",
+              "hostname": "vpn-node",
+              "cap_add": ["NET_ADMIN", "SYS_MODULE"],
+              "cap_drop": ["ALL"],
+              "privileged": true,
+              "labels": {"com.example.env": "dev", "com.example.team": "infra"},
+              "extra_hosts": ["host.docker.internal:host-gateway"],
+              "init": true,
+              "stop_grace_period": "30s",
+              "probes": {}
+            }
+          },
+          "volumes": {
+            "pgdata": {"driver": "local"},
+            "cache": {}
+          }
+        }"#;
+        let setup: SetupJson = serde_json::from_str(json).unwrap();
+        let svc = &setup.services["vpn"];
+
+        // entrypoint as string
+        assert_eq!(svc.entrypoint.as_ref().unwrap().as_str(), Some("/init.sh"));
+        assert_eq!(svc.user.as_deref(), Some("1000:1000"));
+        assert_eq!(svc.working_dir.as_deref(), Some("/app"));
+        assert_eq!(svc.hostname.as_deref(), Some("vpn-node"));
+        assert_eq!(svc.cap_add, vec!["NET_ADMIN", "SYS_MODULE"]);
+        assert_eq!(svc.cap_drop, vec!["ALL"]);
+        assert_eq!(svc.privileged, Some(true));
+        assert_eq!(svc.labels["com.example.env"], "dev");
+        assert_eq!(svc.labels["com.example.team"], "infra");
+        assert_eq!(svc.extra_hosts, vec!["host.docker.internal:host-gateway"]);
+        assert_eq!(svc.init, Some(true));
+        assert_eq!(svc.stop_grace_period.as_deref(), Some("30s"));
+
+        // Top-level volumes
+        assert_eq!(setup.volumes.len(), 2);
+        assert_eq!(setup.volumes["pgdata"].driver.as_deref(), Some("local"));
+        assert!(setup.volumes["cache"].driver.is_none());
+    }
+
+    #[test]
+    fn parse_entrypoint_array() {
+        let json = r#"{
+          "services": {
+            "app": {
+              "image": "myapp:latest",
+              "entrypoint": ["/bin/sh", "-c", "echo hello"],
+              "probes": {}
+            }
+          }
+        }"#;
+        let setup: SetupJson = serde_json::from_str(json).unwrap();
+        let ep = setup.services["app"].entrypoint.as_ref().unwrap();
+        assert!(ep.is_array());
+        assert_eq!(ep.as_array().unwrap().len(), 3);
     }
 }
