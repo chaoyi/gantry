@@ -48,6 +48,22 @@ class GantryClient:
     def graph(self):
         return self.api('get', '/graph')
 
+    def status(self):
+        return self.api('get', '/status')
+
+    def ws_snapshot(self):
+        """Get WS snapshot — connect, read first message, disconnect."""
+        try:
+            import websocket
+            ws_url = self.base.replace('http', 'ws') + '/api/ws'
+            ws = websocket.create_connection(ws_url, timeout=5)
+            import json
+            data = json.loads(ws.recv())
+            ws.close()
+            return data
+        except Exception:
+            return None
+
     def graph_full(self):
         g = self.graph()
         svcs, runtimes, tgts, probes = {}, {}, {}, {}
@@ -90,31 +106,26 @@ class GantryClient:
             lambda: self.graph_full()[3].get(probe_key) == expected, timeout
         )
 
-    def ensure_green(self):
-        for _ in range(3):
-            r = self.converge(timeout=120)
-            if r.get('result') == 'ok':
-                return True
-        return False
-
-
 def _fresh_start(compose_dir, port):
-    subprocess.run(['docker', 'compose', 'down', '--timeout', '5'],
+    subprocess.run(['docker', 'compose', 'down', '--remove-orphans', '--timeout', '5'],
                    capture_output=True, timeout=30, cwd=compose_dir)
-    subprocess.run(['docker', 'compose', 'build'],
-                   capture_output=True, timeout=300, cwd=compose_dir)
     subprocess.run(['docker', 'compose', 'up', '--no-start'],
                    capture_output=True, timeout=30, cwd=compose_dir)
     subprocess.run(['docker', 'compose', 'start', 'gantry'],
                    capture_output=True, timeout=15, cwd=compose_dir)
     client = GantryClient(f'http://localhost:{port}')
     assert client.wait_ready(), f"Gantry not responding on port {port}"
+    # All services should be stopped (only gantry running).
+    # Wait until gantry is idle and all services show stopped.
+    client.wait_for(lambda: all(
+        v == 'stopped' for v in client.graph_full()[0].values()
+    ), timeout=15)
     return client
 
 
 @pytest.fixture(scope='session')
 def demo():
-    """Demo fixture (6 services, port 9090). Reuses running instance or starts fresh."""
+    """Demo fixture (8 services, 2 isolated groups, port 9090). Reuses running instance or starts fresh."""
     client = GantryClient('http://localhost:9090')
     if not client.wait_ready(timeout=5):
         _fresh_start(DEMO_DIR, 9090)
@@ -130,6 +141,20 @@ def timeout_fixture():
         _fresh_start(TIMEOUT_DIR, 9092)
         client = GantryClient('http://localhost:9092')
     yield client
+
+
+@pytest.fixture
+def green(demo):
+    """Full docker compose restart + converge for clean isolation."""
+    _fresh_start(DEMO_DIR, 9090)
+    r = None
+    for _ in range(3):
+        r = demo.converge(timeout=120)
+        if r.get('result') == 'ok':
+            break
+        time.sleep(1)
+    assert r and r.get('result') == 'ok', f"Failed to converge after 3 attempts: {r}"
+    yield demo
 
 
 @pytest.fixture(autouse=True)

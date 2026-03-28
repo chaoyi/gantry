@@ -150,6 +150,8 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 
 .dot-green { background: #00aa44; box-shadow: 0 0 4px #00aa4455; }
 .dot-red { background: #ff0000; box-shadow: 0 0 4px #ff000055; }
+.dot-probing { background: #4c566a; box-shadow: 0 0 4px #4c566a55; animation: dotPulse 2s ease-in-out infinite; }
+.dot-pending { background: #4c566a; }
 .dot-stale { background: #4c566a; box-shadow: 0 0 4px #4c566a55; animation: dotPulse 2s ease-in-out infinite; }
 @keyframes dotPulse { 0%, 100% { opacity: 0.5; } 50% { opacity: 1; } }
 .dot-gray { background: #4c566a; }
@@ -187,6 +189,7 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 .probe-text { fill: var(--text-dim); font-size: 11px; }
 @keyframes svgDotPulse { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; } }
 .dot-stale-svg { animation: svgDotPulse 2s ease-in-out infinite; }
+.dot-probing-svg { animation: svgDotPulse 2s ease-in-out infinite; }
 @keyframes dotProbing { 0%, 100% { opacity: 0.3; } 50% { opacity: 1; } }
 @keyframes nodeFlashAnim { 0% { opacity: 0.5; } 100% { opacity: 0; } }
 .probe-dep-label { fill: #4c566a; font-size: 8px; }
@@ -306,6 +309,8 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 .badge-target { background: #b48ead33; color: #b48ead; }
 .badge-op { background: #d0877033; color: #d08770; }
 .badge-restart { background: #bf616a33; color: #bf616a; }
+.badge-probing { background: #a3be8c33; color: #a3be8c; }
+.badge-pending { background: #a3be8c33; color: #a3be8c; }
 .badge-message { background: #5e81ac55; color: #88c0d0; }
 .event-row .summary { flex: 1; word-break: break-word; }
 .event-row .expand-btn {
@@ -455,85 +460,59 @@ html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(-
 // STATE
 // ══════════════════════════════════════════════════════════════════════
 const S = {
-  graph: null,       // from /api/graph
-  services: {},      // name -> { state, probes: { probe: { state } } }
-  targets: {},       // name -> { state }
+  graph: null,       // from /api/graph (static topology)
+  services: {},      // name → { state, runtime, probes: { name → { state, reason } } }
+  targets: {},       // name → { state, reason }
   events: [],
   selection: null,   // { type: 'probe'|'service'|'target', id }
-  layout: null,
+  layout: null,      // positions from ELK
   transform: { x: 0, y: 0, scale: 1 },
   autoScroll: true,
   wsRetryDelay: 1000,
+  probeFlash: {},    // probeKey → startTimestamp (active flash animations)
 };
 
 // ══════════════════════════════════════════════════════════════════════
 // CONSTANTS
 // ══════════════════════════════════════════════════════════════════════
-const CARD_W = 160;
-const HEADER_H = 28;
-const PROBE_H = 22;
-const CARD_PAD = 2;
-const LEVEL_GAP = 280;
-const NODE_GAP = 20;
-const TARGET_W = 130;
-const TARGET_H = 36;
-const MAX_EVENTS = 1000;
+const CARD_W = 160, HEADER_H = 28, PROBE_H = 22, CARD_PAD = 2;
+const NODE_GAP = 20, TARGET_W = 160, MAX_EVENTS = 1000;
 
 // ══════════════════════════════════════════════════════════════════════
-// UTILITIES
+// COLOR & STATE ACCESSORS
 // ══════════════════════════════════════════════════════════════════════
-// Visual state colors:
-//   green   - all probes green, healthy
-//   red     - at least one probe probed and failed, or service crashed
-//   stale   - some probes stale, none red
-//   pending - service running but probes not yet checked (all red, no probe history)
-// State colors — consistent across graph SVG and tree panel:
-//   green   = #00aa44 (LED green)
-//   red     = #ff0000 (LED red)
-//   stale   = #4c566a (gray, pulsing — needs reprobe)
-//   stopped = #3b4252 (dim gray — inactive)
-function stateBgFill(st) {
-  if (st === 'green') return '#1f3330';
-  if (st === 'red' || st === 'crashed') return '#4a2028';
-  if (st === 'stale') return '#252830';
-  if (st === 'stopped') return '#1e2228';
-  return '#2e3440';
-}
 function stateColor(st) {
   if (st === 'green') return '#00aa44';
   if (st === 'red' || st === 'crashed') return '#ff0000';
-  if (st === 'stale') return '#4c566a';
-  if (st === 'stopped') return '#3b4252';
+  if (st === 'stale' || st === 'probing' || st === 'pending') return '#4c566a';
+  if (st === 'stopped' || st === 'inactive') return '#3b4252';
   return '#4c566a';
 }
-// Dependency context: green, red, or gray-pulsing (stale).
-function depColor(st) {
-  if (st === 'green') return stateColor('green');
-  if (st === 'stale') return stateColor('stale'); // gray, pulsing handled by class
-  return stateColor('red');
+function stateBgFill(st) {
+  if (st === 'green') return '#1f3330';
+  if (st === 'red' || st === 'crashed') return '#4a2028';
+  if (st === 'stale' || st === 'probing' || st === 'pending') return '#252830';
+  if (st === 'stopped' || st === 'inactive') return '#1e2228';
+  return '#2e3440';
 }
 function stateDotClass(st) {
   if (st === 'green') return 'dot-green';
   if (st === 'red' || st === 'crashed') return 'dot-red';
-  if (st === 'stale') return 'dot-stale';
-  if (st === 'stopped') return 'dot-stopped';
+  if (st === 'probing') return 'dot-probing';
+  if (st === 'pending') return 'dot-pending';
+  if (st === 'stopped' || st === 'inactive') return 'dot-stopped';
   return 'dot-gray';
 }
-function svcBgState(svc) {
-  return probeState(svc.name, 'ready');
+function depColor(st) {
+  if (st === 'green') return '#00aa44';
+  if (st === 'stale' || st === 'probing' || st === 'pending') return '#4c566a';
+  return '#ff0000';
 }
-function probeState(svc, probe) {
-  return S.services[svc]?.probes?.[probe]?.state || 'stopped';
-}
-function targetState(name) {
-  return S.targets[name]?.state || 'stopped';
-}
-function visibleProbes(svc) {
-  return svc.probes.filter(c => c.name !== 'ready');
-}
-function svcCardH(svc) {
-  return HEADER_H + visibleProbes(svc).length * PROBE_H + CARD_PAD * 2;
-}
+function probeState(svc, probe) { return S.services[svc]?.probes?.[probe]?.state || 'stopped'; }
+function targetState(name) { return S.targets[name]?.state || 'stopped'; }
+function svcBgState(svc) { return S.services[svc.name]?.state || probeState(svc.name, 'ready'); }
+function visibleProbes(svc) { return svc.probes.filter(c => c.name !== 'ready'); }
+function svcCardH(svc) { return HEADER_H + visibleProbes(svc).length * PROBE_H + CARD_PAD * 2; }
 function svgEl(tag, attrs) {
   const el = document.createElementNS('http://www.w3.org/2000/svg', tag);
   for (const [k, v] of Object.entries(attrs || {})) el.setAttribute(k, v);
@@ -542,6 +521,194 @@ function svgEl(tag, attrs) {
 function bezier(x1, y1, x2, y2) {
   const dx = Math.abs(x2 - x1) * 0.45;
   return `M${x1},${y1} C${x1 + dx},${y1} ${x2 - dx},${y2} ${x2},${y2}`;
+}
+function escHtml(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+
+// ══════════════════════════════════════════════════════════════════════
+// STATE MUTATIONS — all state changes go through these three functions
+// ══════════════════════════════════════════════════════════════════════
+
+// Initialize from /api/graph. Won't overwrite data already set by WS snapshot.
+function initState(graph) {
+  for (const svc of graph.services) {
+    if (!S.services[svc.name]) S.services[svc.name] = { state: svc.state, runtime: svc.runtime, reason: svc.reason || null, probes: {} };
+    for (const probe of svc.probes) {
+      if (!S.services[svc.name].probes[probe.name]) {
+        S.services[svc.name].probes[probe.name] = { state: probe.state, reason: probe.reason || null };
+      }
+    }
+  }
+  for (const tgt of graph.targets) {
+    if (!S.targets[tgt.name]) S.targets[tgt.name] = { state: tgt.state, reason: tgt.reason || null };
+  }
+}
+
+// Bulk state from WS snapshot.
+function applySnapshot(msg) {
+  for (const [name, data] of Object.entries(msg.services || {})) {
+    S.services[name] = { state: data.state, runtime: data.runtime, probes: {} };
+    for (const [pn, pd] of Object.entries(data.probes || {})) {
+      S.services[name].probes[pn] = { state: pd.state, reason: pd.reason || null };
+    }
+  }
+  for (const [name, data] of Object.entries(msg.targets || {})) {
+    S.targets[name] = { state: data.state, reason: data.reason || null };
+  }
+}
+
+// Incremental state from a single WS event.
+function applyEvent(ev) {
+  if (ev.category === 'service' && ev.data) {
+    const name = ev.data.service;
+    if (name && S.services[name]) {
+      S.services[name].state = ev.data.display_state || ev.data.state;
+      if (ev.data.state) S.services[name].runtime = ev.data.state;
+      if (ev.data.reason !== undefined) S.services[name].reason = ev.data.reason;
+    }
+  } else if (ev.category === 'probe_state' && ev.data) {
+    const parts = ev.data.probe?.split('.');
+    if (parts?.length === 2 && S.services[parts[0]]) {
+      const probes = S.services[parts[0]].probes;
+      if (!probes[parts[1]]) probes[parts[1]] = {};
+      probes[parts[1]].state = ev.data.display_state || ev.data.state;
+      if (ev.data.reason !== undefined) probes[parts[1]].reason = ev.data.reason;
+      probes[parts[1]].reason = ev.data.reason || null;
+    }
+  } else if (ev.category === 'target' && ev.data) {
+    const name = ev.data.target;
+    if (name) S.targets[name] = { state: ev.data.state, reason: ev.data.reason || null };
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// VIEW UPDATE — single function syncs all SVG + tree DOM to state
+// ══════════════════════════════════════════════════════════════════════
+function updateView() {
+  if (!S.graph) return;
+  const svg = document.getElementById('graph-svg');
+
+  function setSvgDot(sel, st) {
+    svg.querySelectorAll(sel).forEach(el => {
+      el.style.fill = stateColor(st);
+      
+      el.classList.toggle('dot-probing-svg', st === 'probing');
+    });
+  }
+  function setTreeDot(sel, st) {
+    document.querySelectorAll(sel).forEach(el => { el.className = `dot ${stateDotClass(st)}`; });
+  }
+
+  // Services
+  for (const svc of S.graph.services) {
+    const bg = svcBgState(svc);
+    const ready = probeState(svc.name, 'ready');
+    const st = S.services[svc.name]?.state || 'stopped';
+    const inactive = st === 'stopped' || st === 'inactive';
+    const rt = S.services[svc.name]?.runtime || 'stopped';
+
+    svg.querySelectorAll(`[data-bg="${svc.name}"]`).forEach(el => el.style.fill = stateBgFill(bg));
+    setSvgDot(`[data-dot="svc:${svc.name}"]`, ready);
+    setTreeDot(`[data-tree-dot="svc:${svc.name}"]`, ready);
+    document.querySelectorAll(`[data-runtime="${svc.name}"]`).forEach(el => {
+      el.textContent = rt !== 'running' ? rt : '';
+    });
+
+    for (const probe of svc.probes) {
+      const cs = inactive ? 'stopped' : probeState(svc.name, probe.name);
+      if (!S.probeFlash[`${svc.name}.${probe.name}`]) {
+        setSvgDot(`[data-dot="probe:${svc.name}.${probe.name}"]`, cs);
+      }
+      setTreeDot(`[data-tree-dot="probe:${svc.name}.${probe.name}"]`, cs);
+      for (const dep of (probe.depends_on || [])) {
+        const [ds, dc] = dep.split('.');
+        const dSt = inactive ? 'stopped' : probeState(ds, dc);
+        svg.querySelectorAll(`[data-dot="dep:${svc.name}.${probe.name}:${dep}"]`).forEach(el => {
+          el.style.fill = inactive ? stateColor('stopped') : depColor(dSt);
+          
+          el.classList.toggle('dot-probing-svg', !inactive && dSt === 'probing');
+        });
+      }
+    }
+  }
+
+  // Targets
+  for (const tgt of S.graph.targets) {
+    const ts = targetState(tgt.name);
+    const off = ts === 'stopped' || ts === 'inactive';
+
+    setSvgDot(`[data-dot="tgt:${tgt.name}"]`, ts);
+    setTreeDot(`[data-tree-dot="tgt:${tgt.name}"]`, ts);
+    svg.querySelectorAll(`[data-bg="tgt:${tgt.name}"]`).forEach(el => el.style.fill = stateBgFill(ts));
+
+    for (const dep of (tgt.depends_on || [])) {
+      const ds = off ? 'stopped' : targetState(dep);
+      svg.querySelectorAll(`[data-dot="tgt-dep:${tgt.name}:${dep}"]`).forEach(el => {
+        el.style.fill = off ? stateColor('stopped') : depColor(ds);
+        
+        el.classList.toggle('dot-probing-svg', !off && ds === 'probing');
+      });
+    }
+    const p = S.layout?.[`target:${tgt.name}`];
+    if (p) for (const ref of (p.directProbes || [])) {
+      const [s, c] = ref.split('.');
+      const tcs = off ? 'stopped' : probeState(s, c);
+      svg.querySelectorAll(`[data-dot="tgt-probe:${tgt.name}:${ref}"]`).forEach(el => {
+        el.style.fill = off ? stateColor('stopped') : depColor(tcs);
+        
+        el.classList.toggle('dot-probing-svg', !off && tcs === 'probing');
+      });
+    }
+  }
+
+  // Edge colors — stroke by source state, animate active flows
+  document.querySelectorAll('#edges path, #fg path, #edges .intra-arc, #fg .intra-arc').forEach(edge => {
+    const from = edge.dataset.from, to = edge.dataset.to;
+    if (!from) return;
+
+    let srcSt;
+    if (from.startsWith('target:')) srcSt = targetState(from.slice(7));
+    else { const [s, c] = from.split('.'); srcSt = (s && c) ? probeState(s, c) : 'stopped'; }
+
+    let destSt = null;
+    if (to) {
+      if (to.startsWith('target:')) destSt = targetState(to.slice(7));
+      else if (to.includes('.')) { const [ds, dc] = to.split('.'); if (ds && dc) destSt = probeState(ds, dc); }
+      else destSt = S.services[to]?.state || 'stopped';
+    }
+
+    const bothOff = (srcSt === 'stopped' || srcSt === 'inactive') && (destSt === 'stopped' || destSt === 'inactive');
+    const eff = (!bothOff && srcSt === 'stopped' && destSt && destSt !== 'stopped' && destSt !== 'inactive') ? 'red' : srcSt;
+    edge.style.stroke = stateColor(eff);
+    edge.classList.remove('edge-pulse', 'edge-flow');
+    if (eff === 'green' && destSt && destSt !== 'green') edge.classList.add('edge-flow');
+    else if (eff === 'probing' || eff === 'pending') edge.classList.add('edge-pulse');
+  });
+}
+
+// Probe flash animation — white pulse while probing, restore on result.
+function handleProbeFlash(ev) {
+  const svg = document.getElementById('graph-svg');
+  if (ev.category === 'probe' && ev.data?.attempt === 0 && ev.entity) {
+    S.probeFlash[ev.entity] = Date.now();
+    svg.querySelectorAll(`[data-dot="probe:${ev.entity}"]`).forEach(dot => {
+      dot.style.fill = '#e5e9f0';
+      dot.style.animation = 'dotProbing 0.5s ease-in-out infinite';
+    });
+  }
+  if (ev.category === 'probe_state' && ev.data?.probe) {
+    const key = ev.data.probe;
+    if (S.probeFlash[key]) {
+      const remaining = Math.max(0, 300 - (Date.now() - S.probeFlash[key]));
+      setTimeout(() => {
+        delete S.probeFlash[key];
+        svg.querySelectorAll(`[data-dot="probe:${key}"]`).forEach(dot => {
+          dot.style.animation = '';
+          dot.style.fill = '';
+        });
+        updateView();
+      }, remaining);
+    }
+  }
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -554,7 +721,7 @@ const Layout = {
     const svcMap = {};
     for (const s of svcs) svcMap[s.name] = s;
 
-    // Compute direct probes per target
+    // Compute direct probes per target (exclude inherited from depends_on)
     const tgtMap = {};
     for (const t of tgts) tgtMap[t.name] = t;
     for (const t of tgts) {
@@ -566,7 +733,7 @@ const Layout = {
       t._directProbes = t.probes.filter(c => !inherited.has(c));
     }
 
-    // Build ELK graph — services only. Targets positioned manually.
+    // Build ELK graph — services only, targets positioned manually
     const elkNodes = [];
     const elkEdges = [];
     let edgeId = 0;
@@ -592,7 +759,6 @@ const Layout = {
         layoutOptions: { 'portConstraints': 'FIXED_POS' } });
     }
 
-    // Service edges only
     for (const svc of svcs) {
       for (const ref of svc.start_after) {
         elkEdges.push({ id: `e${edgeId++}`,
@@ -643,7 +809,7 @@ const Layout = {
       svcMaxY = Math.max(svcMaxY, node.y + node.height);
     }
 
-    // Position targets manually: single column to the right, ordered by depth (leaf top, aggregate bottom)
+    // Position targets: single column to the right, ordered by depth
     const tgtDepth = {};
     function calcDepth(name) {
       if (tgtDepth[name] !== undefined) return tgtDepth[name];
@@ -655,12 +821,25 @@ const Layout = {
     }
     for (const t of tgts) calcDepth(t.name);
 
-    const sortedTgts = [...tgts].sort((a, b) => (tgtDepth[a.name] || 0) - (tgtDepth[b.name] || 0));
-    const tgtX = maxX + 100; // river gap
+    const tgtX = maxX + 100;
     const tgtRowH = (t) => {
       const rows = (t.depends_on || []).length + (t._directProbes || []).length;
       return HEADER_H + rows * PROBE_H + CARD_PAD * 2;
     };
+
+    // Sort targets: by service centroid Y (keeps groups together), then by depth within group
+    const tgtCentroid = (t) => {
+      const svcs = (t.probes || []).map(p => p.split('.')[0]);
+      const ys = svcs.map(s => positions[s]).filter(Boolean).map(p => p.y + p.h / 2);
+      return ys.length ? ys.reduce((a, b) => a + b, 0) / ys.length : 0;
+    };
+    const sortedTgts = [...tgts].sort((a, b) => {
+      const ca = tgtCentroid(a), cb = tgtCentroid(b);
+      if (Math.abs(ca - cb) > 50) return ca - cb;  // different service groups
+      return (tgtDepth[a.name] || 0) - (tgtDepth[b.name] || 0);  // same group: by depth
+    });
+
+    // Single column, centered on service midpoint
     const totalTgtH = sortedTgts.reduce((s, t) => s + tgtRowH(t) + NODE_GAP, -NODE_GAP);
     const svcMidY = (svcMinY + svcMaxY) / 2;
     let tgtY = svcMidY - totalTgtH / 2;
@@ -710,7 +889,7 @@ const Graph = {
   root: null,
   edgeGroup: null,
   nodeGroup: null,
-  fgGroup: null, // foreground: highlighted arcs render on top
+  fgGroup: null,
   elements: {},
 
   render(graph, positions) {
@@ -728,7 +907,6 @@ const Graph = {
     const svcMap = {};
     for (const s of graph.services) svcMap[s.name] = s;
 
-    // Helper: find probe anchor — ready probes route to header, others to visible row
     function probeAnchorFor(svcName, probeName, side) {
       if (probeName === 'ready') return Layout.svcHeaderAnchor(positions, svcName, side);
       const svc = svcMap[svcName];
@@ -739,60 +917,48 @@ const Graph = {
       return Layout.probeAnchor(positions, svcName, idx, side);
     }
 
-    // Draw edges
+    // Draw inter-service edges
     for (const svc of graph.services) {
-      // start_after edges: probe → service header (solid, prominent)
       for (const ref of svc.start_after) {
         const [depSvc, depProbe] = ref.split('.');
         if (!svcMap[depSvc]) continue;
         const from = probeAnchorFor(depSvc, depProbe, 'right');
         const to = Layout.svcHeaderAnchor(positions, svc.name, 'left');
-        const path = svgEl('path', {
+        this.edgeGroup.appendChild(svgEl('path', {
           d: bezier(from.x, from.y, to.x, to.y),
           class: 'edge-start-after',
-          'data-from': `${depSvc}.${depProbe}`,
-          'data-to': svc.name,
-          'data-type': 'start_after',
-        });
-        this.edgeGroup.appendChild(path);
+          'data-from': `${depSvc}.${depProbe}`, 'data-to': svc.name, 'data-type': 'start_after',
+        }));
       }
-      // depends_on edges: probe → probe (solid, thinner) — skip ready and intra-service
       const svcVisProbes = visibleProbes(svc);
       for (let ci = 0; ci < svcVisProbes.length; ci++) {
         const probe = svcVisProbes[ci];
         for (const ref of (probe.depends_on || [])) {
           const [depSvc, depProbe] = ref.split('.');
-          if (!depSvc || !depProbe) continue;
-          if (depSvc === svc.name) continue;
+          if (!depSvc || !depProbe || depSvc === svc.name) continue;
           if (!svcMap[depSvc]) continue;
           const from = probeAnchorFor(depSvc, depProbe, 'right');
           const to = Layout.probeAnchor(positions, svc.name, ci, 'left');
-          const path = svgEl('path', {
+          this.edgeGroup.appendChild(svgEl('path', {
             d: bezier(from.x, from.y, to.x, to.y),
             class: 'edge-depends-on',
-            'data-from': ref,
-            'data-to': `${svc.name}.${probe.name}`,
-            'data-type': 'depends_on',
-          });
-          this.edgeGroup.appendChild(path);
+            'data-from': ref, 'data-to': `${svc.name}.${probe.name}`, 'data-type': 'depends_on',
+          }));
         }
       }
     }
 
-    // Target edges — only draw from DIRECT probes (not transitive)
-    // We need to figure out which probes are direct vs inherited from depends_on targets
+    // Target edges — only direct probes (not inherited from depends_on)
     const tgtMap = {};
     for (const t of graph.targets) tgtMap[t.name] = t;
 
     for (const tgt of graph.targets) {
-      // Collect probes from dependent targets to exclude
       const inheritedProbes = new Set();
       for (const depName of (tgt.depends_on || [])) {
         const depTgt = tgtMap[depName];
         if (depTgt) for (const c of depTgt.probes) inheritedProbes.add(c);
       }
 
-      // Draw edges only from direct (non-inherited) probes → target probe rows
       const directProbes = positions[`target:${tgt.name}`]?.directProbes || [];
       const depOffset = (positions[`target:${tgt.name}`]?.dependsOn || []).length;
       for (let ti = 0; ti < directProbes.length; ti++) {
@@ -801,30 +967,23 @@ const Graph = {
         if (!svcMap[depSvc]) continue;
         const from = probeAnchorFor(depSvc, depProbe, 'right');
         const to = Layout.targetProbeAnchor(positions, tgt.name, depOffset + ti, 'left');
-        const path = svgEl('path', {
+        this.edgeGroup.appendChild(svgEl('path', {
           d: bezier(from.x, from.y, to.x, to.y),
           class: 'edge-target',
-          'data-from': ref,
-          'data-to': `target:${tgt.name}`,
-          'data-type': 'target',
-        });
-        this.edgeGroup.appendChild(path);
+          'data-from': ref, 'data-to': `target:${tgt.name}`, 'data-type': 'target',
+        }));
       }
 
-      // Draw target-to-target dependency edges (connect to the dep row)
       const depTargets = positions[`target:${tgt.name}`]?.dependsOn || [];
       for (let di = 0; di < depTargets.length; di++) {
         const depName = depTargets[di];
         const from = Layout.targetAnchor(positions, depName, 'right');
         const to = Layout.targetProbeAnchor(positions, tgt.name, di, 'left');
-        const path = svgEl('path', {
+        this.edgeGroup.appendChild(svgEl('path', {
           d: bezier(from.x, from.y, to.x, to.y),
           class: 'edge-target-dep',
-          'data-from': `target:${depName}`,
-          'data-to': `target:${tgt.name}`,
-          'data-type': 'target-dep',
-        });
-        this.edgeGroup.appendChild(path);
+          'data-from': `target:${depName}`, 'data-to': `target:${tgt.name}`, 'data-type': 'target-dep',
+        }));
       }
     }
 
@@ -835,29 +994,16 @@ const Graph = {
       g.addEventListener('contextmenu', (e) => { e.preventDefault(); ContextMenu.showService(e, svc.name); });
 
       // Card background
-      const bg = svgEl('rect', { width: p.w, height: p.h, rx: 6, ry: 6, fill: 'var(--card-bg)', stroke: 'var(--card-border)', 'stroke-width': 1, 'data-bg': svc.name });
-      g.appendChild(bg);
+      g.appendChild(svgEl('rect', { width: p.w, height: p.h, rx: 6, ry: 6, fill: 'var(--card-bg)', stroke: 'var(--card-border)', 'stroke-width': 1, 'data-bg': svc.name }));
 
       // Header
-      const headerBg = svgEl('rect', { width: p.w, height: HEADER_H, rx: 6, ry: 6, fill: '#1e222a33' });
-      g.appendChild(headerBg);
-      // Bottom corners overlap fix
-      const headerFix = svgEl('rect', { y: HEADER_H - 6, width: p.w, height: 6, fill: '#1e222a33' });
-      g.appendChild(headerFix);
-
-      // Status dot in header
-      const dot = svgEl('circle', { cx: 14, cy: HEADER_H / 2, r: 4, fill: 'var(--gray)', 'data-dot': `svc:${svc.name}` });
-      g.appendChild(dot);
-
-      // Service name (with tooltip for reason)
+      g.appendChild(svgEl('rect', { width: p.w, height: HEADER_H, rx: 6, ry: 6, fill: '#1e222a33' }));
+      g.appendChild(svgEl('rect', { y: HEADER_H - 6, width: p.w, height: 6, fill: '#1e222a33' }));
+      g.appendChild(svgEl('circle', { cx: 14, cy: HEADER_H / 2, r: 4, fill: 'var(--gray)', 'data-dot': `svc:${svc.name}` }));
       const svcText = svgEl('text', { x: 26, y: HEADER_H / 2 + 4, class: 'svc-header-text', 'data-svc': svc.name, 'data-svc-label': svc.name });
       svcText.textContent = svc.name;
       g.appendChild(svcText);
-
-      // Runtime state label (right-aligned in header)
       g.appendChild(svgEl('text', { x: p.w - 6, y: HEADER_H / 2 + 3, class: 'svc-runtime-text', 'text-anchor': 'end', 'data-runtime': svc.name }));
-
-      // Header click area (also carries hover tooltip)
       const headerHit = svgEl('rect', { width: p.w, height: HEADER_H, fill: 'transparent', cursor: 'pointer', 'data-svc-hit': svc.name });
       headerHit.addEventListener('click', () => Interaction.selectService(svc.name));
       g.appendChild(headerHit);
@@ -868,20 +1014,16 @@ const Graph = {
         const probe = visProbes[ci];
         const cy = HEADER_H + CARD_PAD + ci * PROBE_H;
 
-        // Probe dot
         g.appendChild(svgEl('circle', { cx: 14, cy: cy + PROBE_H / 2, r: 3, fill: 'var(--gray)', 'data-dot': `probe:${svc.name}.${probe.name}` }));
-
-        // Probe name + reason tooltip
         const probeText = svgEl('text', { x: 26, y: cy + PROBE_H / 2 + 3, class: 'probe-text', 'data-probe-label': `${svc.name}.${probe.name}` });
         probeText.textContent = probe.name;
         g.appendChild(probeText);
 
-        // Cross-service dependency indicators (dots + labels if space allows)
+        // Cross-service dependency indicators
         const crossDeps = (probe.depends_on || []).filter(d => d.split('.')[0] !== svc.name);
         if (crossDeps.length > 0) {
-          const nameWidth = probe.name.length * 7 + 30; // probe name + dot + padding
+          const nameWidth = probe.name.length * 7 + 30;
           const available = p.w - nameWidth - 8;
-          // Compute total label width to decide if labels fit
           const labels = crossDeps.map(d => { const [ds, dc] = d.split('.'); return dc === 'ready' ? ds : `${ds}.${dc}`; });
           const totalLabelW = labels.reduce((s, l) => s + l.length * 5.5 + 12, 0);
           const showLabels = totalLabelW < available;
@@ -900,20 +1042,16 @@ const Graph = {
           }
         }
 
-        // Click area (also carries hover tooltip)
         const hit = svgEl('rect', { x: 0, y: cy, width: p.w, height: PROBE_H, class: 'probe-hit', 'data-probe-hit': `${svc.name}.${probe.name}` });
         hit.addEventListener('click', () => Interaction.selectProbe(`${svc.name}.${probe.name}`));
         g.appendChild(hit);
       }
 
-
       this.nodeGroup.appendChild(g);
 
-      // Intra-service dependency edges (behind card, in edge layer, skip ready)
+      // Intra-service dependency arcs
       const visProbeIdx = {};
-      for (let ci = 0; ci < visProbes.length; ci++) {
-        visProbeIdx[visProbes[ci].name] = ci;
-      }
+      for (let ci = 0; ci < visProbes.length; ci++) visProbeIdx[visProbes[ci].name] = ci;
       for (let ci = 0; ci < visProbes.length; ci++) {
         const probe = visProbes[ci];
         for (const ref of (probe.depends_on || [])) {
@@ -923,22 +1061,19 @@ const Graph = {
           if (di === undefined) continue;
           const fromY = p.y + HEADER_H + CARD_PAD + di * PROBE_H + PROBE_H / 2;
           const toY = p.y + HEADER_H + CARD_PAD + ci * PROBE_H + PROBE_H / 2;
-          const fromX = p.x + p.w;
-          const toX = p.x;
-          const dx = Math.abs(fromX - toX) * 0.45;
+          const fromX = p.x + p.w, toX = p.x;
+          const ddx = Math.abs(fromX - toX) * 0.45;
           this.edgeGroup.appendChild(svgEl('path', {
-            d: `M${fromX},${fromY} C${fromX + dx},${fromY} ${toX - dx},${toY} ${toX},${toY}`,
-            fill: 'none', stroke: '#4c566a', 'stroke-width': 1,
-            class: 'intra-arc',
-            'data-from': `${svc.name}.${depProbe}`,
-            'data-to': `${svc.name}.${probe.name}`,
+            d: `M${fromX},${fromY} C${fromX + ddx},${fromY} ${toX - ddx},${toY} ${toX},${toY}`,
+            fill: 'none', stroke: '#4c566a', 'stroke-width': 1, class: 'intra-arc',
+            'data-from': `${svc.name}.${depProbe}`, 'data-to': `${svc.name}.${probe.name}`,
           }));
         }
       }
       this.elements[`svc:${svc.name}`] = g;
     }
 
-    // Draw target nodes (with depends_on target rows + probe rows)
+    // Draw target nodes
     for (const tgt of graph.targets) {
       const p = positions[`target:${tgt.name}`];
       const directProbes = p.directProbes || [];
@@ -948,37 +1083,26 @@ const Graph = {
       g.addEventListener('click', (e) => { if (!e.target.closest('.probe-hit')) Interaction.selectTarget(tgt.name); });
       g.style.cursor = 'pointer';
 
-      // Card background
       g.appendChild(svgEl('rect', { width: p.w, height: p.h, rx: 6, ry: 6, fill: 'var(--card-bg)', stroke: 'var(--card-border)', 'stroke-width': 1, 'data-bg': `tgt:${tgt.name}` }));
-
-      // Header background
       g.appendChild(svgEl('rect', { width: p.w, height: HEADER_H, rx: 6, ry: 6, fill: '#1e222a33' }));
       g.appendChild(svgEl('rect', { y: HEADER_H - 6, width: p.w, height: 6, fill: '#1e222a33' }));
-
-      // Status dot + name
       g.appendChild(svgEl('circle', { cx: 14, cy: HEADER_H / 2, r: 4, fill: 'var(--gray)', 'data-dot': `tgt:${tgt.name}` }));
       const tgtText = svgEl('text', { x: 26, y: HEADER_H / 2 + 4, class: 'svc-header-text', 'data-tgt-label': tgt.name });
       tgtText.textContent = tgt.name;
       g.appendChild(tgtText);
-
-      // Header click area
-      const headerHit = svgEl('rect', { width: p.w, height: HEADER_H, fill: 'transparent', cursor: 'pointer' });
-      headerHit.addEventListener('click', () => Interaction.selectTarget(tgt.name));
-      g.appendChild(headerHit);
+      const tgtHeaderHit = svgEl('rect', { width: p.w, height: HEADER_H, fill: 'transparent', cursor: 'pointer' });
+      tgtHeaderHit.addEventListener('click', () => Interaction.selectTarget(tgt.name));
+      g.appendChild(tgtHeaderHit);
 
       let rowIdx = 0;
 
-      // Depends-on target rows (with TGT badge)
+      // Depends-on target rows
       for (const depName of depTargets) {
         const cy = HEADER_H + CARD_PAD + rowIdx * PROBE_H;
         g.appendChild(svgEl('circle', { cx: 14, cy: cy + PROBE_H / 2, r: 3, fill: 'var(--gray)', 'data-dot': `tgt-dep:${tgt.name}:${depName}` }));
-
-        // TGT badge
         g.appendChild(svgEl('rect', { x: 24, y: cy + PROBE_H / 2 - 6, width: 22, height: 12, rx: 2, fill: 'var(--card-border)' }));
         g.appendChild(svgEl('text', { x: 35, y: cy + PROBE_H / 2 + 3, class: 'target-badge', 'text-anchor': 'middle' })).textContent = 'TGT';
-
         g.appendChild(svgEl('text', { x: 50, y: cy + PROBE_H / 2 + 3, class: 'probe-text' })).textContent = depName;
-
         const hit = svgEl('rect', { x: 0, y: cy, width: p.w, height: PROBE_H, class: 'probe-hit' });
         hit.addEventListener('click', () => Interaction.selectTarget(depName));
         g.appendChild(hit);
@@ -989,14 +1113,10 @@ const Graph = {
       for (let ci = 0; ci < directProbes.length; ci++) {
         const ref = directProbes[ci];
         const cy = HEADER_H + CARD_PAD + rowIdx * PROBE_H;
-
         g.appendChild(svgEl('circle', { cx: 14, cy: cy + PROBE_H / 2, r: 3, fill: 'var(--gray)', 'data-dot': `tgt-probe:${tgt.name}:${ref}` }));
-
-        // Short label: db.ready → db, db.port → db.port
         const [rs, rc] = ref.split('.');
         const refLabel = rc === 'ready' ? rs : ref;
         g.appendChild(svgEl('text', { x: 26, y: cy + PROBE_H / 2 + 3, class: 'probe-text' })).textContent = refLabel;
-
         const hit = svgEl('rect', { x: 0, y: cy, width: p.w, height: PROBE_H, class: 'probe-hit' });
         hit.addEventListener('click', () => Interaction.selectProbe(ref));
         g.appendChild(hit);
@@ -1007,7 +1127,7 @@ const Graph = {
       this.elements[`tgt:${tgt.name}`] = g;
     }
 
-    this.updateColors();
+    updateView();
     this.centerView(positions);
   },
 
@@ -1020,13 +1140,10 @@ const Graph = {
       maxY = Math.max(maxY, p.y + p.h);
     }
     const svg = document.getElementById('graph-svg');
-    const sw = svg.clientWidth;
-    const sh = svg.clientHeight;
-    const gw = maxX - minX + 80;
-    const gh = maxY - minY + 80;
+    const sw = svg.clientWidth, sh = svg.clientHeight;
+    const gw = maxX - minX + 80, gh = maxY - minY + 80;
     const scale = Math.min(sw / gw, sh / gh, 1.2);
-    const cx = (minX + maxX) / 2;
-    const cy = (minY + maxY) / 2;
+    const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
     S.transform = { x: sw / 2 - cx * scale, y: sh / 2 - cy * scale, scale };
     this.applyTransform();
   },
@@ -1034,114 +1151,6 @@ const Graph = {
   applyTransform() {
     const { x, y, scale } = S.transform;
     this.root.setAttribute('transform', `translate(${x},${y}) scale(${scale})`);
-  },
-
-  updateColors() {
-    if (!S.graph) return;
-    const svg = document.getElementById('graph-svg');
-    const set = (sel, color) => { svg.querySelectorAll(sel).forEach(el => { el.style.fill = color; }); };
-    const setOne = (sel, fn) => { svg.querySelectorAll(sel).forEach(fn); };
-
-    for (const svc of S.graph.services) {
-      const bgState = svcBgState(svc);
-      set(`[data-bg="${svc.name}"]`, stateBgFill(bgState));
-
-      const rs = probeState(svc.name, 'ready');
-      setOne(`[data-dot="svc:${svc.name}"]`, el => {
-        el.style.fill = stateColor(rs);
-        el.classList.toggle('dot-stale-svg', rs === 'stale');
-      });
-
-      setOne(`[data-runtime="${svc.name}"]`, el => {
-        const ds = S.services[svc.name]?.state || 'stopped';
-        el.textContent = (ds === 'stopped') ? 'stopped' : '';
-      });
-
-      for (const probe of svc.probes) {
-        const cs = probeState(svc.name, probe.name);
-        setOne(`[data-dot="probe:${svc.name}.${probe.name}"]`, el => {
-          if (el._probeStart) return; // don't override probe flash
-          el.style.fill = stateColor(cs);
-          el.classList.toggle('dot-stale-svg', cs === 'stale');
-        });
-        for (const dep of (probe.depends_on || [])) {
-          const [ds, dc] = dep.split('.');
-          const dcs = probeState(ds, dc);
-          setOne(`[data-dot="dep:${svc.name}.${probe.name}:${dep}"]`, el => {
-            el.style.fill = depColor(dcs);
-            el.classList.toggle('dot-stale-svg', dcs === 'stale');
-          });
-        }
-      }
-    }
-    for (const tgt of S.graph.targets) {
-      const ts = targetState(tgt.name);
-      setOne(`[data-dot="tgt:${tgt.name}"]`, el => {
-        el.style.fill = stateColor(ts);
-        el.classList.toggle('dot-stale-svg', ts === 'stale');
-      });
-      set(`[data-bg="tgt:${tgt.name}"]`, stateBgFill(ts));
-      // Target dep/probe dots use depColor (dependency context: green or red)
-      for (const dep of (tgt.depends_on || [])) {
-        const ds = targetState(dep);
-        setOne(`[data-dot="tgt-dep:${tgt.name}:${dep}"]`, el => {
-          el.style.fill = depColor(ds);
-          el.classList.toggle('dot-stale-svg', ds === 'stale');
-        });
-      }
-      const p = S.layout?.[`target:${tgt.name}`];
-      if (p) {
-        for (const ref of (p.directProbes || [])) {
-          const [svc, probeName] = ref.split('.');
-          const tcs = probeState(svc, probeName);
-          setOne(`[data-dot="tgt-probe:${tgt.name}:${ref}"]`, el => {
-            el.style.fill = depColor(tcs);
-            el.classList.toggle('dot-stale-svg', tcs === 'stale');
-          });
-        }
-      }
-    }
-    // Color edges by source state + pulse if source green but dest not
-    document.querySelectorAll('#edges path, #fg path, #edges .intra-arc, #fg .intra-arc').forEach(edge => {
-      const from = edge.dataset.from;
-      const to = edge.dataset.to;
-      if (!from) return;
-
-      let srcState;
-      if (from.startsWith('target:')) {
-        srcState = targetState(from.slice(7));
-      } else {
-        const [s, c] = from.split('.');
-        srcState = (s && c) ? probeState(s, c) : 'stopped';
-      }
-
-      let destState = null;
-      if (to) {
-        if (to.startsWith('target:')) {
-          destState = targetState(to.slice(7));
-        } else if (to.includes('.')) {
-          const [ds, dc] = to.split('.');
-          if (ds && dc) destState = probeState(ds, dc);
-        } else {
-          // Service name (start_after dest)
-          destState = S.services[to]?.state || 'stopped';
-        }
-      }
-
-      // If dest is active (not stopped), stopped source = red (unsatisfied dependency)
-      const destActive = destState && destState !== 'stopped';
-      const effectiveSrc = (srcState === 'stopped' && destActive) ? 'red' : srcState;
-
-      edge.style.stroke = stateColor(effectiveSrc);
-      edge.classList.remove('edge-pulse', 'edge-flow');
-      if (effectiveSrc === 'green' && destState && destState !== 'green') {
-        edge.classList.add('edge-flow');
-      } else if (effectiveSrc === 'stale') {
-        edge.classList.add('edge-pulse');
-      }
-    });
-
-    Tree.updateColors();
   }
 };
 
@@ -1180,14 +1189,14 @@ const Tree = {
         const cn = document.createElement('div');
         cn.className = 'tree-node probe-node';
         cn.dataset.probe = `${svc.name}.${probe.name}`;
-        cn.innerHTML = `<span class="dot dot-gray" data-tree-dot="probe:${svc.name}.${probe.name}"></span><span class="label">${probe.name}</span><span class="reason-text" data-tree-reason="probe:${svc.name}.${probe.name}"></span>`;
+        cn.innerHTML = `<span class="dot dot-gray" data-tree-dot="probe:${svc.name}.${probe.name}"></span><span class="label">${probe.name}</span>`;
         cn.addEventListener('click', (e) => { e.stopPropagation(); Interaction.selectProbe(`${svc.name}.${probe.name}`); });
         probesList.appendChild(cn);
       }
       st.appendChild(probesList);
     }
 
-    // Build target map + compute direct probes (exclude inherited from depends_on targets)
+    // Build target tree
     const tgtMap = {};
     for (const t of S.graph.targets) tgtMap[t.name] = t;
 
@@ -1206,7 +1215,7 @@ const Tree = {
       const node = document.createElement('div');
       node.className = 'tree-node target-node';
       node.dataset.target = tgt.name;
-      node.innerHTML = `${hasChildren ? `<span class="chevron ${isOpen ? 'open' : ''}">&#9654;</span>` : '<span style="width:12px;display:inline-block"></span>'}<span class="dot dot-gray" data-tree-dot="tgt:${tgt.name}"></span><span class="label">${tgt.name}</span><span class="reason-text" data-tree-reason="tgt:${tgt.name}"></span>`;
+      node.innerHTML = `${hasChildren ? `<span class="chevron ${isOpen ? 'open' : ''}">&#9654;</span>` : '<span style="width:12px;display:inline-block"></span>'}<span class="dot dot-gray" data-tree-dot="tgt:${tgt.name}"></span><span class="label">${tgt.name}</span>`;
       node.addEventListener('click', () => {
         if (hasChildren) {
           if (this.expanded.has(tgtKey)) this.expanded.delete(tgtKey);
@@ -1221,8 +1230,6 @@ const Tree = {
       if (hasChildren) {
         const children = document.createElement('div');
         children.className = `tree-probes ${isOpen ? '' : 'collapsed'}`;
-
-        // Show depends_on targets
         for (const dep of (tgt.depends_on || [])) {
           const dn = document.createElement('div');
           dn.className = 'tree-node probe-node target-node';
@@ -1231,48 +1238,19 @@ const Tree = {
           dn.addEventListener('click', (e) => { e.stopPropagation(); Interaction.selectTarget(dep); });
           children.appendChild(dn);
         }
-
-        // Show direct probes
         for (const ref of directProbes) {
           const cn = document.createElement('div');
           cn.className = 'tree-node probe-node';
           cn.dataset.probe = ref;
-          cn.innerHTML = `<span class="dot dot-gray" data-tree-dot="probe:${ref}"></span><span class="label">${ref}</span><span class="reason-text" data-tree-reason="probe:${ref}"></span>`;
+          cn.innerHTML = `<span class="dot dot-gray" data-tree-dot="probe:${ref}"></span><span class="label">${ref}</span>`;
           cn.addEventListener('click', (e) => { e.stopPropagation(); Interaction.selectProbe(ref); });
           children.appendChild(cn);
         }
-
         tt.appendChild(children);
       }
     }
 
-    this.updateColors();
-  },
-
-  updateColors() {
-    if (!S.graph) return;
-    for (const svc of S.graph.services) {
-      // Service dot = ready probe state
-      document.querySelectorAll(`[data-tree-dot="svc:${svc.name}"]`).forEach(d => {
-        d.className = `dot ${stateDotClass(probeState(svc.name, 'ready'))}`;
-      });
-      // Runtime label (stopped/running/crashed)
-      document.querySelectorAll(`[data-runtime="${svc.name}"]`).forEach(el => {
-        const ds = S.services[svc.name]?.state || 'stopped';
-        const runtime = (ds === 'stopped') ? 'stopped' : '';
-        el.textContent = runtime;
-      });
-      for (const probe of svc.probes) {
-        document.querySelectorAll(`[data-tree-dot="probe:${svc.name}.${probe.name}"]`).forEach(d => {
-          d.className = `dot ${stateDotClass(probeState(svc.name, probe.name))}`;
-        });
-      }
-    }
-    for (const tgt of S.graph.targets) {
-      document.querySelectorAll(`[data-tree-dot="tgt:${tgt.name}"]`).forEach(d => {
-        d.className = `dot ${stateDotClass(targetState(tgt.name))}`;
-      });
-    }
+    updateView();
   },
 
   syncSelection(sel, probeSet) {
@@ -1280,7 +1258,6 @@ const Tree = {
     if (!sel) return;
 
     if (probeSet) {
-      // Auto-expand involved services and targets, collapse the rest
       const involvedSvcs = new Set();
       for (const c of probeSet) involvedSvcs.add(c.split('.')[0]);
       const involvedTgts = new Set();
@@ -1289,7 +1266,6 @@ const Tree = {
           if (tgt.probes.some(c => probeSet.has(c))) involvedTgts.add(`tgt:${tgt.name}`);
         }
       }
-
       this.expanded = new Set([...involvedSvcs, ...involvedTgts]);
       this.render();
     }
@@ -1319,12 +1295,7 @@ const Events = {
     const list = document.getElementById('event-list');
     const row = this.createRow(ev);
     list.appendChild(row);
-
-    // Prune DOM
-    while (list.children.length > MAX_EVENTS * 2) {
-      list.removeChild(list.firstChild);
-    }
-
+    while (list.children.length > MAX_EVENTS * 2) list.removeChild(list.firstChild);
     this.applyFilter(row);
 
     if (S.autoScroll) {
@@ -1335,72 +1306,58 @@ const Events = {
   },
 
   createRow(ev) {
-    const frag = document.createDocumentFragment();
     const row = document.createElement('div');
     row.className = 'event-row';
     row.dataset.category = ev.category;
     row.dataset.level = ev.level || 'info';
 
     const ts = new Date(ev.ts).toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    const badgeLabel = { service: 'SVC', probe_state: 'PRB', probe: 'ATT', target: 'TGT', op: 'CMD', restart: 'ACT', message: 'MSG' }[ev.category] || ev.category;
+    const badgeLabel = { service: 'SVC', probe_state: 'PRB', probe: 'ATT', target: 'TGT', op: 'CMD', message: 'MSG' }[ev.category] || ev.category;
     row.dataset.searchtext = `${ts} ${badgeLabel} ${ev.category} ${ev.entity || ''} ${ev.summary || ''}`.toLowerCase();
     const hasDetail = ev.detail && ev.detail.length > 0;
     const evState = ev.data?.display_state || ev.data?.state || '';
-    const dotColor = { green: 'var(--green)', red: 'var(--red)', stale: 'var(--gray)', stopped: 'var(--gray)' }[evState] || '';
+    const dotColor = { green: 'var(--green)', red: 'var(--red)', stale: 'var(--gray)', probing: 'var(--gray)', pending: 'var(--gray)', stopped: 'var(--gray)', inactive: 'var(--gray)' }[evState] || '';
     const dotCls = (ev.category === 'target' || ev.category === 'service') ? 'event-dot-lg' : 'event-dot';
     const isOp = ev.category === 'op';
     const isProbeAttempt = ev.category === 'probe';
     const isOk = isOp && ev.data?.result === 'ok';
     const isProbeOk = isProbeAttempt && ev.data?.result === 'ok';
     const isFail = (isOp && ev.data?.result === 'failed') || (isProbeAttempt && ev.data?.result === 'fail');
-    // Indicator: dots for state events, icons for operations/actions/attempts
     const icoStyle = 'width:8px;flex-shrink:0;font-size:10px;text-align:center';
     let indicator;
+    const isRestart = isOp && ev.data?.op === 'restart';
     if (ev.category === 'message') {
       indicator = `<span style="${icoStyle};color:#88c0d0">ℹ</span>`;
-    } else if (ev.category === 'restart') {
-      // ACT: gantry action (restart decision)
+    } else if (isRestart) {
       indicator = `<span style="${icoStyle};color:#d08770">↻</span>`;
     } else if (isOk) {
-      // CMD complete ok
       indicator = `<span class="event-ok" style="${icoStyle}">✓</span>`;
     } else if (isFail) {
-      // CMD complete fail
       indicator = `<span class="event-fail" style="${icoStyle}">✗</span>`;
     } else if (isOp) {
-      // CMD start
       indicator = `<span style="${icoStyle};color:var(--text-dim)">▶</span>`;
     } else if (isProbeOk) {
-      // ATT ok
       indicator = `<span class="event-ok" style="${icoStyle}">✓</span>`;
     } else if (isProbeAttempt) {
-      // ATT fail
       indicator = `<span class="event-fail" style="${icoStyle}">✗</span>`;
     } else if (dotColor) {
-      // SVC/TGT/PRB: colored dot
       indicator = `<span class="${dotCls}" style="background:${dotColor}"></span>`;
     } else {
       indicator = '<span class="event-dot-spacer"></span>';
     }
     row.innerHTML = `<span class="ts">${ts}</span><span class="badge badge-${ev.category}">${badgeLabel}</span>${indicator}<span class="summary">${escHtml(ev.summary)}</span>${hasDetail ? '<span class="expand-btn">+</span>' : ''}`;
 
-    // Click event row to highlight related entity in graph + flash node
     row.addEventListener('click', () => {
       const entity = ev.entity;
       if (!entity) return;
       const svcName = entity.includes('.') ? entity.split('.')[0] : entity;
-      if (entity.includes('.')) {
-        Interaction.selectProbe(entity);
-      } else if (S.graph?.targets?.find(t => t.name === entity)) {
-        Interaction.selectTarget(entity);
-      } else if (S.graph?.services?.find(s => s.name === entity)) {
-        Interaction.selectService(entity);
-      }
-      // Flash the node card — temporary bright stroke that fades
+      if (entity.includes('.')) Interaction.selectProbe(entity);
+      else if (S.graph?.targets?.find(t => t.name === entity)) Interaction.selectTarget(entity);
+      else if (S.graph?.services?.find(s => s.name === entity)) Interaction.selectService(entity);
+      // Flash the node card
       const svg = document.getElementById('graph-svg');
       const sel = S.graph?.targets?.find(t => t.name === entity)
-        ? `[data-target="${entity}"]`
-        : `[data-svc="${svcName}"]`;
+        ? `[data-target="${entity}"]` : `[data-svc="${svcName}"]`;
       svg.querySelectorAll(sel).forEach(g => {
         const bg = g.querySelector('[data-bg]');
         if (!bg) return;
@@ -1444,22 +1401,15 @@ const Events = {
     }
   },
 
-  applyFilterAll() {
-    this.applyFilter(null);
-  }
+  applyFilterAll() { this.applyFilter(null); }
 };
-
-function escHtml(s) {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
 
 // ══════════════════════════════════════════════════════════════════════
 // INTERACTION (highlighting, zoom, pan)
 // ══════════════════════════════════════════════════════════════════════
 const Interaction = {
-  // Dependency indexes
-  depForward: {},  // probe -> [probes it depends_on]
-  depReverse: {},  // probe -> [probes that depend on it]
+  depForward: {},   // probe → [probes it depends_on]
+  depReverse: {},   // probe → [probes that depend on it]
 
   buildIndex(graph) {
     this.depForward = {};
@@ -1472,8 +1422,6 @@ const Interaction = {
           (this.depReverse[dep] = this.depReverse[dep] || []).push(key);
         }
       }
-      // Include start_after relationships: all probes in this service
-      // logically depend on the start_after probes for highlighting
       for (const saProbe of (svc.start_after || [])) {
         for (const probe of svc.probes) {
           const key = `${svc.name}.${probe.name}`;
@@ -1498,8 +1446,7 @@ const Interaction = {
   },
 
   collectChain(seeds) {
-    const up = new Set();
-    const down = new Set();
+    const up = new Set(), down = new Set();
     for (const s of seeds) this.walkUp(s, up);
     for (const s of seeds) this.walkDown(s, down);
     return new Set([...up, ...down]);
@@ -1535,41 +1482,30 @@ const Interaction = {
   clearSelection() {
     S.selection = null;
     document.querySelectorAll('#graph-root *[data-svc], #graph-root *[data-target]').forEach(el => el.style.opacity = '');
-    // Clear selection indicator
     document.querySelectorAll('[data-bg]').forEach(el => { el.style.stroke = ''; });
-    // Move all edges back to edge layer
-    document.querySelectorAll('#fg path, #fg .intra-arc').forEach(el => {
-      Graph.edgeGroup.appendChild(el);
-    });
+    document.querySelectorAll('#fg path, #fg .intra-arc').forEach(el => { Graph.edgeGroup.appendChild(el); });
     document.querySelectorAll('#edges path, .intra-arc').forEach(el => el.style.opacity = '');
     Tree.syncSelection(null);
   },
 
   highlight(probeSet, targetMatchProbes) {
-    // Determine which services are involved
     const involvedSvcs = new Set();
     for (const c of probeSet) involvedSvcs.add(c.split('.')[0]);
-
-    // Determine which targets reference any of the targetMatchProbes
     const involvedTgts = new Set();
     for (const tgt of S.graph.targets) {
       if (tgt.probes.some(c => targetMatchProbes.has(c))) involvedTgts.add(tgt.name);
     }
 
-    // Clear previous selection indicator
     document.querySelectorAll('[data-bg]').forEach(el => { el.style.stroke = ''; });
-
-    // Subtle selection indicator — light border on selected node
     if (S.selection) {
       const selKey = S.selection.type === 'target' ? `tgt:${S.selection.id}` :
         S.selection.type === 'service' ? S.selection.id :
-        S.selection.id.split('.')[0]; // probe → service
+        S.selection.id.split('.')[0];
       const bg = document.querySelector(`[data-bg="${selKey}"]`) ||
         document.querySelector(`[data-bg="tgt:${S.selection.id}"]`);
-      if (bg) { bg.style.stroke = '#8890a0'; }
+      if (bg) bg.style.stroke = '#8890a0';
     }
 
-    // Dim all nodes
     for (const svc of S.graph.services) {
       const el = Graph.elements[`svc:${svc.name}`];
       if (el) el.style.opacity = involvedSvcs.has(svc.name) ? '1' : String(0.15);
@@ -1579,53 +1515,40 @@ const Interaction = {
       if (el) el.style.opacity = involvedTgts.has(tgt.name) ? '1' : String(0.15);
     }
 
-    // Dim/highlight edges (search both bg and fg groups)
     document.querySelectorAll('#edges path, #fg path').forEach(path => {
-      const from = path.dataset.from;
-      const to = path.dataset.to;
-      const type = path.dataset.type;
+      const from = path.dataset.from, to = path.dataset.to, type = path.dataset.type;
       let show = false;
-      if (type === 'start_after') {
-        show = probeSet.has(from) && involvedSvcs.has(to);
-      } else if (type === 'depends_on') {
-        show = probeSet.has(from) && probeSet.has(to);
-      } else if (type === 'target') {
-        show = probeSet.has(from) && involvedTgts.has(to.replace('target:', ''));
-      } else if (type === 'target-dep') {
-        show = involvedTgts.has(from.replace('target:', '')) && involvedTgts.has(to.replace('target:', ''));
-      }
+      if (type === 'start_after') show = probeSet.has(from) && involvedSvcs.has(to);
+      else if (type === 'depends_on') show = probeSet.has(from) && probeSet.has(to);
+      else if (type === 'target') show = probeSet.has(from) && involvedTgts.has(to.replace('target:', ''));
+      else if (type === 'target-dep') show = involvedTgts.has(from.replace('target:', '')) && involvedTgts.has(to.replace('target:', ''));
       path.style.opacity = show ? '0.9' : String(0.06);
       path.style.strokeWidth = '';
-      if (show) { Graph.fgGroup.appendChild(path); }
-      else { Graph.edgeGroup.appendChild(path); }
+      if (show) Graph.fgGroup.appendChild(path);
+      else Graph.edgeGroup.appendChild(path);
     });
 
-    // Highlight intra-service arcs (may be in #edges or #fg)
     document.querySelectorAll('#edges .intra-arc, #fg .intra-arc').forEach(arc => {
-      const from = arc.dataset.from;
-      const to = arc.dataset.to;
+      const from = arc.dataset.from, to = arc.dataset.to;
       const show = probeSet.has(from) && probeSet.has(to);
       arc.style.opacity = show ? '0.9' : '';
-      if (show) { Graph.fgGroup.appendChild(arc); }
-      else { Graph.edgeGroup.appendChild(arc); }
+      if (show) Graph.fgGroup.appendChild(arc);
+      else Graph.edgeGroup.appendChild(arc);
     });
   },
 
   initZoomPan() {
     const svg = document.getElementById('graph-svg');
-    let dragging = false;
-    let dragStart = { x: 0, y: 0 };
+    let dragging = false, dragStart = { x: 0, y: 0 };
 
     svg.addEventListener('wheel', (e) => {
       if (!e.ctrlKey && !e.metaKey) return;
       e.preventDefault();
       const rect = svg.getBoundingClientRect();
-      const mx = e.clientX - rect.left;
-      const my = e.clientY - rect.top;
+      const mx = e.clientX - rect.left, my = e.clientY - rect.top;
       const oldScale = S.transform.scale;
       const factor = e.deltaY < 0 ? 1.08 : 0.93;
       const newScale = Math.max(0.3, Math.min(3, oldScale * factor));
-      // Zoom toward cursor
       S.transform.x = mx - (mx - S.transform.x) * (newScale / oldScale);
       S.transform.y = my - (my - S.transform.y) * (newScale / oldScale);
       S.transform.scale = newScale;
@@ -1646,28 +1569,17 @@ const Interaction = {
     });
     window.addEventListener('mouseup', () => { dragging = false; });
 
-    // Click empty to clear
     svg.addEventListener('click', (e) => {
-      if (e.target === svg || e.target.id === 'graph-root') {
-        Interaction.clearSelection();
-      }
+      if (e.target === svg || e.target.id === 'graph-root') Interaction.clearSelection();
     });
 
-    // Right-click empty space — global context menu
-    // Check that the click is not on a service/target card
     svg.addEventListener('contextmenu', (e) => {
       if (e.target.closest('.svc-card') || e.target.closest('.target-card')) return;
       e.preventDefault();
       const targets = S.graph?.targets || [];
-      const items = targets.map(t => ({
-        label: `Converge ${t.name}`,
-        action: () => API.convergeTarget(t.name),
-      }));
+      const items = targets.map(t => ({ label: `Converge ${t.name}`, action: () => API.convergeTarget(t.name) }));
       if (items.length > 0) items.push({ sep: true });
-      items.push({
-        label: 'Reprobe All',
-        action: () => API.run('reprobe', 'all', '/reprobe/all', { timeout: 60 }),
-      });
+      items.push({ label: 'Reprobe All', action: () => API.run('reprobe', 'all', '/reprobe/all', { timeout: 60 }) });
       ContextMenu.show(e.clientX, e.clientY, items);
     });
   }
@@ -1680,22 +1592,20 @@ const ContextMenu = {
   el: document.getElementById('context-menu'),
 
   showService(e, name) {
-    const items = [
+    this.show(e.clientX, e.clientY, [
       { label: 'Start', action: () => API.startService(name) },
       { label: 'Stop', action: () => API.stopService(name) },
       { label: 'Restart', action: () => API.restartService(name) },
       { sep: true },
       { label: 'Reprobe', action: () => API.reprobeService(name) },
-    ];
-    this.show(e.clientX, e.clientY, items);
+    ]);
   },
 
   showTarget(e, name) {
-    const items = [
+    this.show(e.clientX, e.clientY, [
       { label: 'Converge', action: () => API.convergeTarget(name) },
       { label: 'Reprobe', action: () => API.reprobeTarget(name) },
-    ];
-    this.show(e.clientX, e.clientY, items);
+    ]);
   },
 
   show(x, y, items) {
@@ -1716,16 +1626,14 @@ const ContextMenu = {
     this.el.style.display = 'block';
   },
 
-  hide() {
-    this.el.style.display = 'none';
-  }
+  hide() { this.el.style.display = 'none'; }
 };
 
 document.addEventListener('click', () => ContextMenu.hide());
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { ContextMenu.hide(); Interaction.clearSelection(); }});
 
 // ══════════════════════════════════════════════════════════════════════
-// API
+// API & TOAST
 // ══════════════════════════════════════════════════════════════════════
 const API = {
   async post(path, params = {}) {
@@ -1733,10 +1641,11 @@ const API = {
     const query = params.timeout ? `${sep}timeout=${params.timeout}` : '';
     try {
       const resp = await fetch(`/api${path}${query}`, { method: 'POST' });
-      return await resp.json();
+      const body = await resp.json();
+      if (!resp.ok && !body.result) return { result: 'error', error: body.error || `HTTP ${resp.status}` };
+      return body;
     } catch (e) {
-      console.error('API error:', e);
-      return { result: 'error', error: String(e) };
+      return { result: 'error', error: 'network error' };
     }
   },
 
@@ -1746,7 +1655,8 @@ const API = {
     if (result?.result === 'ok') {
       Toast.show(`${op} ${entity}: ok${result.duration_ms ? ` (${result.duration_ms}ms)` : ''}`, 'ok');
     } else {
-      Toast.show(`${op} ${entity}: ${result?.error || result?.result || 'failed'}`, 'fail');
+      const ng = result?.not_green?.length ? ` [${result.not_green.join(', ')}]` : '';
+      Toast.show(`${op} ${entity}: ${result?.error || result?.result || 'failed'}${ng}`, 'fail');
     }
     return result;
   },
@@ -1792,8 +1702,7 @@ const WS = {
 
   connect() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const url = `${proto}//${location.host}/api/ws`;
-    this.ws = new WebSocket(url);
+    this.ws = new WebSocket(`${proto}//${location.host}/api/ws`);
 
     this.ws.onopen = () => {
       S.wsRetryDelay = 1000;
@@ -1805,9 +1714,13 @@ const WS = {
       try {
         const msg = JSON.parse(e.data);
         if (msg.type === 'snapshot') {
-          this.handleSnapshot(msg);
+          applySnapshot(msg);
+          updateView();
         } else {
-          this.handleEvent(msg);
+          applyEvent(msg);
+          handleProbeFlash(msg);
+          updateView();
+          Events.append(msg);
         }
       } catch (err) {
         console.error('WS parse error:', err);
@@ -1822,83 +1735,14 @@ const WS = {
     };
 
     this.ws.onerror = () => { this.ws.close(); };
-  },
-
-  handleSnapshot(msg) {
-    // Merge service states
-    for (const [name, data] of Object.entries(msg.services || {})) {
-      S.services[name] = { state: data.state, probes: {} };
-      for (const [probeName, cdata] of Object.entries(data.probes || {})) {
-        S.services[name].probes[probeName] = { state: cdata.state, reason: cdata.reason || null };
-      }
-    }
-    // Merge target states
-    for (const [name, data] of Object.entries(msg.targets || {})) {
-      S.targets[name] = { state: data.state, reason: data.reason || null };
-    }
-    Graph.updateColors();
-    Tree.updateColors();
-  },
-
-  handleEvent(ev) {
-    // Update state
-    if (ev.category === 'service' && ev.data) {
-      const svc = ev.data.service;
-      if (svc && S.services[svc]) S.services[svc].state = ev.data.display_state || ev.data.state;
-    } else if (ev.category === 'probe_state' && ev.data) {
-      const parts = ev.data.probe?.split('.');
-      if (parts?.length === 2 && S.services[parts[0]]) {
-        if (!S.services[parts[0]].probes[parts[1]]) {
-          S.services[parts[0]].probes[parts[1]] = {};
-        }
-        S.services[parts[0]].probes[parts[1]].state = ev.data.display_state || ev.data.state;
-        S.services[parts[0]].probes[parts[1]].reason = ev.data.reason || null;
-      }
-    } else if (ev.category === 'target' && ev.data) {
-      const tgt = ev.data.target;
-      if (tgt) S.targets[tgt] = { state: ev.data.state, reason: ev.data.reason || null };
-    }
-
-    // Probe activity: probe event with attempt=0 means "probe started", flash that probe's dot
-    if (ev.category === 'probe' && ev.data?.attempt === 0 && ev.entity) {
-      const svg = document.getElementById('graph-svg');
-      svg.querySelectorAll(`[data-dot="probe:${ev.entity}"]`).forEach(dot => {
-        dot.style.fill = '#e5e9f0';
-        dot.style.animation = 'dotProbing 0.5s ease-in-out infinite';
-        dot._probeStart = Date.now();
-      });
-    }
-    // Probe state event = probe finished
-    if (ev.category === 'probe_state' && ev.data?.probe) {
-      const svg = document.getElementById('graph-svg');
-      svg.querySelectorAll(`[data-dot="probe:${ev.data.probe}"]`).forEach(dot => {
-        if (!dot._probeStart) return;
-        const elapsed = Date.now() - dot._probeStart;
-        const remaining = Math.max(0, 300 - elapsed);
-        setTimeout(() => {
-          dot.style.animation = '';
-          dot.style.fill = '';
-          delete dot._probeStart;
-          Graph.updateColors();
-        }, remaining);
-      });
-    }
-
-    try {
-      Graph.updateColors();
-      Tree.updateColors();
-    } catch(e) {
-      console.error('updateColors error:', e);
-    }
-    Events.append(ev);
-
   }
 };
 
 // ══════════════════════════════════════════════════════════════════════
-// EVENT PANEL SETUP
+// PANEL WIRING
 // ══════════════════════════════════════════════════════════════════════
 document.getElementById('event-verbose').addEventListener('change', () => Events.applyFilterAll());
+
 function toggleLeft() {
   document.getElementById('left-panel').classList.toggle('collapsed');
   updateGridColumns();
@@ -1911,12 +1755,14 @@ document.getElementById('left-collapse').addEventListener('click', toggleLeft);
 document.getElementById('left-close').addEventListener('click', toggleLeft);
 document.getElementById('event-collapse').addEventListener('click', toggleRight);
 document.getElementById('right-close').addEventListener('click', toggleRight);
+
 function updateGridColumns() {
   const lc = document.getElementById('left-panel').classList.contains('collapsed');
   const rc = document.getElementById('right-panel').classList.contains('collapsed');
   document.getElementById('app').style.gridTemplateColumns =
     `${lc ? '0px' : '240px'} 1fr ${rc ? '0px' : '380px'}`;
 }
+
 document.getElementById('event-clear').addEventListener('click', () => {
   document.getElementById('event-list').innerHTML = '';
   S.events = [];
@@ -1956,30 +1802,14 @@ async function init() {
   try {
     await loadELK();
     const resp = await fetch('/api/graph');
-    const graph = await resp.json();
-    S.graph = graph;
+    S.graph = await resp.json();
 
-    // Set initial state from graph — DON'T overwrite if WS snapshot already set it
-    for (const svc of graph.services) {
-      if (!S.services[svc.name]) {
-        S.services[svc.name] = { state: svc.state, probes: {} };
-      }
-      for (const probe of svc.probes) {
-        if (!S.services[svc.name].probes[probe.name]) {
-          S.services[svc.name].probes[probe.name] = { state: probe.state, reason: probe.reason || null };
-        }
-      }
-    }
-    for (const tgt of graph.targets) {
-      if (!S.targets[tgt.name]) {
-        S.targets[tgt.name] = { state: tgt.state, reason: tgt.reason || null };
-      }
-    }
+    initState(S.graph);
 
-    const positions = await Layout.compute(graph);
+    const positions = await Layout.compute(S.graph);
     S.layout = positions;
-    Interaction.buildIndex(graph);
-    Graph.render(graph, positions);
+    Interaction.buildIndex(S.graph);
+    Graph.render(S.graph, positions);
     Tree.render();
 
     document.getElementById('loading').style.display = 'none';

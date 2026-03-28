@@ -57,6 +57,7 @@ mod tests {
             depends_on: deps,
             last_probe_ms: None,
             last_error: None,
+            last_log_match: None,
         }
     }
 
@@ -75,6 +76,7 @@ mod tests {
             generation: 0,
             log_since: 0,
             last_emitted_display: None,
+            last_emitted_runtime: None,
         }
     }
 
@@ -130,7 +132,7 @@ mod tests {
     }
 
     #[test]
-    fn meta_not_satisfied_dep_stale() {
+    fn meta_not_satisfied_dep_pending() {
         let svc = make_svc(
             "svc",
             ServiceState::Running,
@@ -138,7 +140,7 @@ mod tests {
                 make_probe(
                     "port",
                     "svc",
-                    ProbeState::Stale(crate::model::StaleReason::Reprobing),
+                    ProbeState::Pending(crate::model::PendingReason::Reprobing),
                     vec![],
                 ),
                 make_probe(

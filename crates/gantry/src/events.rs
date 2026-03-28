@@ -12,6 +12,9 @@ pub enum Event {
         service: String,
         state: ServiceState,
         display_state: String,
+        reason: Option<String>,
+        /// Extra detail for UI expand (e.g. which probe/dep caused the red state)
+        svc_detail: Option<String>,
         ts: i64,
     },
     ProbeStateChange {
@@ -36,6 +39,10 @@ pub enum Event {
         target: String,
         state: TargetState,
         duration_ms: Option<u64>,
+        /// Summary reason computed at emission time
+        reason_override: Option<String>,
+        /// Additional reasons for UI detail expand (when multiple root causes)
+        extra_reasons: Vec<String>,
         ts: i64,
     },
     OpStart {
@@ -50,11 +57,6 @@ pub enum Event {
         duration_ms: u64,
         ts: i64,
     },
-    ServiceRestart {
-        service: String,
-        reason: String,
-        ts: i64,
-    },
     Message {
         text: String,
         ts: i64,
@@ -65,7 +67,7 @@ pub enum Event {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct WsEvent {
-    /// Event type: "service", "probe_state", "probe", "target", "op", "restart", "message"
+    /// Event type: "service", "probe_state", "probe", "target", "op", "message"
     pub category: &'static str,
     /// Log level: "info" or "debug"
     pub level: &'static str,
@@ -89,11 +91,19 @@ fn now_ts() -> i64 {
 }
 
 impl Event {
-    pub fn service_state(service: &str, state: ServiceState, display_state: &str) -> Self {
+    pub fn service_state(
+        service: &str,
+        state: ServiceState,
+        display_state: &str,
+        reason: Option<String>,
+        svc_detail: Option<String>,
+    ) -> Self {
         Self::ServiceState {
             service: service.into(),
             state,
             display_state: display_state.into(),
+            reason,
+            svc_detail,
             ts: now_ts(),
         }
     }
@@ -154,11 +164,19 @@ impl Event {
         }
     }
 
-    pub fn target_state(target: &str, state: TargetState, duration_ms: Option<u64>) -> Self {
+    pub fn target_state(
+        target: &str,
+        state: TargetState,
+        duration_ms: Option<u64>,
+        reason_override: Option<String>,
+        extra_reasons: Vec<String>,
+    ) -> Self {
         Self::TargetState {
             target: target.into(),
             state,
             duration_ms,
+            reason_override,
+            extra_reasons,
             ts: now_ts(),
         }
     }
@@ -199,16 +217,42 @@ impl Event {
             Self::ProbeResult { .. } => "probe",
             Self::TargetState { .. } => "target",
             Self::OpStart { .. } | Self::OpComplete { .. } => "op",
-            Self::ServiceRestart { .. } => "restart",
             Self::Message { .. } => "message",
         }
     }
 
     fn level(&self) -> &'static str {
         match self {
+            // Probe attempts are debug; pending states are debug except Reprobing
             Self::ProbeResult { .. }
             | Self::ProbeStateChange {
-                state: ProbeState::Stale(_),
+                state: ProbeState::Pending(crate::model::PendingReason::DepRecovered { .. }),
+                ..
+            }
+            | Self::ProbeStateChange {
+                state: ProbeState::Pending(crate::model::PendingReason::DepNotReady { .. }),
+                ..
+            }
+            | Self::ProbeStateChange {
+                state: ProbeState::Pending(crate::model::PendingReason::ContainerStarted),
+                ..
+            }
+            | Self::ProbeStateChange {
+                state: ProbeState::Pending(crate::model::PendingReason::Unchecked),
+                ..
+            } => "debug",
+            // DepRed and Stopped propagation is debug — SVC event tells the story.
+            // Still emitted (UI needs probe state for edge colors) but hidden in terminal log.
+            Self::ProbeStateChange {
+                state: ProbeState::Red(crate::model::RedReason::DepRed { .. }),
+                ..
+            }
+            | Self::ProbeStateChange {
+                state: ProbeState::Red(crate::model::RedReason::Stopped),
+                ..
+            }
+            | Self::ProbeStateChange {
+                state: ProbeState::Red(crate::model::RedReason::ContainerDied),
                 ..
             } => "debug",
             _ => "info",
@@ -227,7 +271,6 @@ impl Event {
             Self::OpComplete {
                 target_or_service, ..
             } => target_or_service.clone(),
-            Self::ServiceRestart { service, .. } => service.clone(),
             Self::Message { .. } => String::new(),
         }
     }
@@ -240,27 +283,41 @@ impl Event {
             | Self::TargetState { ts, .. }
             | Self::OpStart { ts, .. }
             | Self::OpComplete { ts, .. }
-            | Self::ServiceRestart { ts, .. }
             | Self::Message { ts, .. } => *ts,
         }
     }
 
     fn summary(&self) -> String {
         match self {
+            // SVC: [entity] state: reason
             Self::ServiceState {
                 service,
                 display_state,
+                reason,
                 ..
-            } => {
-                format!("[{service}] {display_state}")
-            }
+            } => match reason {
+                Some(r) => format!("[{service}] {display_state}: {r}"),
+                None => format!("[{service}] {display_state}"),
+            },
+            // PRB: [entity] green | [entity] display_state: short_reason
             Self::ProbeStateChange {
                 probe,
+                state,
                 display_state,
                 ..
             } => {
-                format!("[{probe}] {display_state}")
+                if state.is_green() {
+                    format!("[{probe}] green")
+                } else {
+                    match state.short_reason() {
+                        Some(r) if r != *display_state => {
+                            format!("[{probe}] {display_state}: {r}")
+                        }
+                        _ => format!("[{probe}] {display_state}"),
+                    }
+                }
             }
+            // ATT: [entity] result: #attempt durms
             Self::ProbeResult {
                 probe,
                 result,
@@ -272,52 +329,39 @@ impl Event {
                     None => String::new(),
                     Some(d) => format!(" {d}ms"),
                 };
-                format!("[{probe}] probe #{attempt}{dur} {result}")
+                format!("[{probe}] {result}: #{attempt}{dur}")
             }
+            // TGT: [entity] state: reason (reason computed at emission time)
             Self::TargetState {
                 target,
                 state,
-                duration_ms,
+                reason_override,
                 ..
-            } => {
-                let s = match state {
-                    TargetState::Green => "ok",
-                    TargetState::Red(_) => "failed",
-                    TargetState::Stale { .. } => "stale",
-                };
-                let dur = duration_ms
-                    .filter(|d| *d > 0)
-                    .map(|d| format!(" {d}ms"))
-                    .unwrap_or_default();
-                format!("[{target}] {s}{dur}")
-            }
+            } => match reason_override {
+                Some(r) => format!("[{target}] {}: {r}", state.as_str()),
+                None => format!("[{target}] {}", state.as_str()),
+            },
+            // CMD
             Self::OpStart {
                 op,
                 target_or_service,
                 ..
-            } => {
-                format!("{op} [{target_or_service}]")
-            }
+            } => format!("{op} [{target_or_service}]"),
             Self::OpComplete {
                 op,
                 target_or_service,
                 result,
                 duration_ms,
                 ..
-            } => {
-                format!("{op} [{target_or_service}] {result} {duration_ms}ms")
-            }
-            Self::ServiceRestart {
-                service, reason, ..
-            } => {
-                format!("[{service}] restart ({reason})")
-            }
+            } => format!("{op} [{target_or_service}] {result} {duration_ms}ms"),
+            // MSG
             Self::Message { text, .. } => text.clone(),
         }
     }
 
     fn detail(&self) -> Vec<String> {
         match self {
+            // ATT: probe type, error, matched lines
             Self::ProbeResult {
                 error,
                 matched_lines,
@@ -330,8 +374,12 @@ impl Event {
                 lines.extend(matched_lines.iter().cloned());
                 lines
             }
-            Self::ProbeStateChange { state, .. } => state.reason().into_iter().collect(),
-            Self::ServiceRestart { reason, .. } => vec![reason.clone()],
+            // SVC: detail from probe/dep info
+            Self::ServiceState { svc_detail, .. } => svc_detail.iter().cloned().collect(),
+            // PRB: entity/error detail from state. Green: no detail (for now).
+            Self::ProbeStateChange { state, .. } => state.state_detail().into_iter().collect(),
+            // TGT: extra reasons when multiple root causes
+            Self::TargetState { extra_reasons, .. } => extra_reasons.clone(),
             _ => Vec::new(),
         }
     }
@@ -342,10 +390,12 @@ impl Event {
                 service,
                 state,
                 display_state,
+                reason,
                 ..
             } => serde_json::json!({
                 "service": service, "state": state.as_str(),
                 "display_state": display_state,
+                "reason": reason,
             }),
             Self::ProbeStateChange {
                 probe,
@@ -380,7 +430,7 @@ impl Event {
                 "target": target,
                 "state": state.as_str(),
                 "duration_ms": duration_ms,
-                "reason": state.reason(),
+                "reason": state.first_red_probe().map(|p| p.to_string()),
             }),
             Self::OpStart {
                 op,
@@ -398,11 +448,6 @@ impl Event {
             } => serde_json::json!({
                 "op": op, "scope": target_or_service,
                 "result": result, "duration_ms": duration_ms,
-            }),
-            Self::ServiceRestart {
-                service, reason, ..
-            } => serde_json::json!({
-                "service": service, "reason": reason,
             }),
             Self::Message { text, .. } => serde_json::json!({"text": text}),
         }
@@ -435,61 +480,23 @@ impl EventBus {
     }
 
     pub fn emit(&self, event: Event) {
-        // Log with appropriate level
-        match &event {
-            Event::OpStart {
-                op,
-                target_or_service,
-                ..
-            } => {
-                tracing::info!("▶ {op} {target_or_service}");
-            }
-            Event::OpComplete {
-                op,
-                target_or_service,
-                result,
-                duration_ms,
-                ..
-            } => {
-                tracing::info!("✓ {op} {target_or_service} → {result} ({duration_ms}ms)");
-            }
-            Event::ServiceState {
-                service,
-                display_state,
-                ..
-            } => {
-                tracing::info!("[{service}] {display_state}");
-            }
-            Event::ServiceRestart {
-                service, reason, ..
-            } => {
-                tracing::info!("[{service}] restart: {reason}");
-            }
-            Event::ProbeStateChange { probe, state, .. } => match state {
-                ProbeState::Stale(_) => tracing::debug!("[{probe}] stale"),
-                _ => tracing::info!("[{probe}] {}", state.as_str()),
-            },
-            Event::TargetState { target, state, .. } => {
-                let s = match state {
-                    TargetState::Green => "green",
-                    TargetState::Red(_) => "red",
-                    TargetState::Stale { .. } => "stale",
-                };
-                tracing::info!("[{target}] {s}");
-            }
-            Event::ProbeResult {
-                probe,
-                result,
-                duration_ms,
-                attempt,
-                ..
-            } => {
-                let dur = duration_ms.map(|d| format!(" {d}ms")).unwrap_or_default();
-                tracing::debug!("[{probe}] probe #{attempt}{dur} {result}");
-            }
-            Event::Message { text, .. } => {
-                tracing::info!("{text}");
-            }
+        // Log: summary + inline detail for target events (full entity info)
+        let ws = event.to_ws_event();
+        let prefix = match ws.category {
+            "service" => "svc",
+            "probe_state" | "probe" => "prb",
+            "target" => "tgt",
+            "op" => "cmd",
+            _ => "   ",
+        };
+        let log_line = if !ws.detail.is_empty() {
+            format!("{prefix} {} — {}", ws.summary, ws.detail.join(", "))
+        } else {
+            format!("{prefix} {}", ws.summary)
+        };
+        match ws.level {
+            "debug" => tracing::debug!("{log_line}"),
+            _ => tracing::info!("{log_line}"),
         }
         // Broadcast to WebSocket subscribers
         let _ = self.tx.send(event);
@@ -507,7 +514,7 @@ mod tests {
 
     #[test]
     fn event_categories() {
-        let svc = Event::service_state("db", ServiceState::Running, "green");
+        let svc = Event::service_state("db", ServiceState::Running, "green", None, None);
         assert_eq!(svc.to_ws_event().category, "service");
 
         let probe = Event::probe_state_change(
@@ -521,7 +528,7 @@ mod tests {
         let result = Event::probe_result(&ProbeRef::new("db", "port"), true, Some(10), 1, None, 0);
         assert_eq!(result.to_ws_event().category, "probe");
 
-        let target = Event::target_state("full", TargetState::Green, None);
+        let target = Event::target_state("full", TargetState::Green, None, None, vec![]);
         assert_eq!(target.to_ws_event().category, "target");
 
         let op = Event::op_start("converge", "full");
@@ -534,26 +541,37 @@ mod tests {
         let result = Event::probe_result(&ProbeRef::new("db", "port"), true, Some(10), 1, None, 0);
         assert_eq!(result.to_ws_event().level, "debug");
 
-        // Stale probe state is debug
-        let stale = Event::probe_state_change(
+        // Reprobing is info (visible to UI for pulsing state)
+        let reprobing = Event::probe_state_change(
             &ProbeRef::new("db", "port"),
-            ProbeState::Stale(crate::model::StaleReason::Reprobing),
+            ProbeState::Pending(crate::model::PendingReason::Reprobing),
             ProbeState::Green,
-            "stale",
+            "probing",
         );
-        assert_eq!(stale.to_ws_event().level, "debug");
+        assert_eq!(reprobing.to_ws_event().level, "info");
+
+        // Other pending states are debug
+        let dep_recovered = Event::probe_state_change(
+            &ProbeRef::new("db", "port"),
+            ProbeState::Pending(crate::model::PendingReason::DepRecovered {
+                dep: ProbeRef::new("redis", "port"),
+            }),
+            ProbeState::Red(crate::model::RedReason::Stopped),
+            "pending",
+        );
+        assert_eq!(dep_recovered.to_ws_event().level, "debug");
 
         // Green/red probe state is info
         let green = Event::probe_state_change(
             &ProbeRef::new("db", "port"),
             ProbeState::Green,
-            ProbeState::Stale(crate::model::StaleReason::Reprobing),
+            ProbeState::Pending(crate::model::PendingReason::Reprobing),
             "green",
         );
         assert_eq!(green.to_ws_event().level, "info");
 
         // Service state is info
-        let svc = Event::service_state("db", ServiceState::Running, "green");
+        let svc = Event::service_state("db", ServiceState::Running, "green", None, None);
         assert_eq!(svc.to_ws_event().level, "info");
     }
 
@@ -570,5 +588,197 @@ mod tests {
         assert_eq!(ws.data["probe"], "db.port");
         assert_eq!(ws.data["state"], "green");
         assert_eq!(ws.data["prev"], "red");
+    }
+
+    // ── Summary format tests ──
+
+    #[test]
+    fn summary_svc_green() {
+        let e = Event::service_state("db", ServiceState::Running, "green", None, None);
+        assert_eq!(e.to_ws_event().summary, "[db] green");
+    }
+
+    #[test]
+    fn summary_svc_red_with_reason() {
+        let e = Event::service_state(
+            "db",
+            ServiceState::Stopped,
+            "red",
+            Some("stopped".into()),
+            None,
+        );
+        assert_eq!(e.to_ws_event().summary, "[db] red: stopped");
+    }
+
+    #[test]
+    fn summary_svc_stopped() {
+        let e = Event::service_state("db", ServiceState::Stopped, "stopped", None, None);
+        assert_eq!(e.to_ws_event().summary, "[db] stopped");
+    }
+
+    #[test]
+    fn summary_probe_green() {
+        let e = Event::probe_state_change(
+            &ProbeRef::new("db", "port"),
+            ProbeState::Green,
+            ProbeState::Pending(crate::model::PendingReason::Reprobing),
+            "green",
+        );
+        assert_eq!(e.to_ws_event().summary, "[db.port] green");
+    }
+
+    #[test]
+    fn summary_probe_red_failed() {
+        let e = Event::probe_state_change(
+            &ProbeRef::new("db", "port"),
+            ProbeState::Red(crate::model::RedReason::ProbeFailed(
+                crate::model::ProbeFailure {
+                    error: "conn refused".into(),
+                    duration_ms: 120,
+                },
+            )),
+            ProbeState::Green,
+            "red",
+        );
+        let ws = e.to_ws_event();
+        assert_eq!(ws.summary, "[db.port] red: probe failed");
+        assert_eq!(ws.detail, vec!["conn refused (120ms)"]);
+    }
+
+    #[test]
+    fn summary_probe_pending() {
+        let e = Event::probe_state_change(
+            &ProbeRef::new("db", "port"),
+            ProbeState::Pending(crate::model::PendingReason::Reprobing),
+            ProbeState::Green,
+            "probing",
+        );
+        assert_eq!(e.to_ws_event().summary, "[db.port] probing: reprobing");
+    }
+
+    #[test]
+    fn summary_target_green() {
+        let e = Event::target_state("app", TargetState::Green, None, None, vec![]);
+        assert_eq!(e.to_ws_event().summary, "[app] green");
+    }
+
+    #[test]
+    fn summary_target_red_probe_failed() {
+        let e = Event::target_state(
+            "app",
+            TargetState::Red {
+                probes: vec![ProbeRef::new("db", "port")],
+                dep_targets: vec![],
+            },
+            None,
+            Some("probe db.port failed".into()),
+            vec![],
+        );
+        let ws = e.to_ws_event();
+        assert_eq!(ws.summary, "[app] red: probe db.port failed");
+        assert!(ws.detail.is_empty());
+    }
+
+    #[test]
+    fn summary_target_red_service_stopped() {
+        let e = Event::target_state(
+            "app",
+            TargetState::Red {
+                probes: vec![ProbeRef::new("db", "port")],
+                dep_targets: vec![],
+            },
+            None,
+            Some("service db stopped".into()),
+            vec![],
+        );
+        let ws = e.to_ws_event();
+        assert_eq!(ws.summary, "[app] red: service db stopped");
+        assert!(ws.detail.is_empty());
+    }
+
+    #[test]
+    fn summary_target_multiple_reasons() {
+        let e = Event::target_state(
+            "app",
+            TargetState::Red {
+                probes: vec![ProbeRef::new("db", "port"), ProbeRef::new("cache", "port")],
+                dep_targets: vec![],
+            },
+            None,
+            Some("service db stopped (+1 more)".into()),
+            vec!["service db stopped".into(), "service cache stopped".into()],
+        );
+        let ws = e.to_ws_event();
+        assert_eq!(ws.summary, "[app] red: service db stopped (+1 more)");
+        assert_eq!(
+            ws.detail,
+            vec!["service db stopped", "service cache stopped"]
+        );
+    }
+
+    #[test]
+    fn summary_target_inactive() {
+        let e = Event::target_state("app", TargetState::Inactive, None, None, vec![]);
+        assert_eq!(e.to_ws_event().summary, "[app] inactive");
+    }
+
+    #[test]
+    fn summary_op_start() {
+        let e = Event::op_start("converge", "app");
+        assert_eq!(e.to_ws_event().summary, "converge [app]");
+    }
+
+    #[test]
+    fn summary_op_restart() {
+        let e = Event::op_start("restart", "db");
+        assert_eq!(e.to_ws_event().summary, "restart [db]");
+        assert_eq!(e.to_ws_event().category, "op");
+    }
+
+    #[test]
+    fn summary_probe_result() {
+        let e = Event::probe_result(&ProbeRef::new("db", "port"), true, Some(5), 1, None, 0);
+        assert_eq!(e.to_ws_event().summary, "[db.port] ok: #1 5ms");
+    }
+
+    // ── Detail tests ──
+
+    #[test]
+    fn detail_probe_green_empty() {
+        // Green probe detail is empty (for now)
+        let e = Event::probe_state_change(
+            &ProbeRef::new("db", "port"),
+            ProbeState::Green,
+            ProbeState::Red(crate::model::RedReason::Stopped),
+            "green",
+        );
+        assert!(e.to_ws_event().detail.is_empty());
+    }
+
+    #[test]
+    fn detail_probe_red_dep() {
+        // Red(DepRed) detail has the dep entity name
+        let e = Event::probe_state_change(
+            &ProbeRef::new("db", "ready"),
+            ProbeState::Red(crate::model::RedReason::DepRed {
+                dep: ProbeRef::new("db", "port"),
+            }),
+            ProbeState::Green,
+            "red",
+        );
+        assert_eq!(e.to_ws_event().detail, vec!["db.port"]);
+    }
+
+    #[test]
+    fn detail_svc_empty() {
+        // Service events have no detail (reason is in summary)
+        let e = Event::service_state(
+            "db",
+            ServiceState::Stopped,
+            "red",
+            Some("stopped".into()),
+            None,
+        );
+        assert!(e.to_ws_event().detail.is_empty());
     }
 }

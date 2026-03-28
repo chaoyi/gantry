@@ -7,7 +7,7 @@ use petgraph::visit::Dfs;
 
 use crate::config::GantryConfig;
 use crate::error::{GantryError, Result};
-use crate::model::{ProbeRef, ProbeState, ServiceRuntime};
+use crate::model::{ProbeRef, ProbeState, ServiceRuntime, ServiceState};
 
 pub struct DependencyGraph {
     pub start_after_graph: DiGraph<String, ()>,
@@ -15,6 +15,9 @@ pub struct DependencyGraph {
     svc_to_node: HashMap<String, NodeIndex>,
     probe_to_node: HashMap<String, NodeIndex>,
     pub topo_order: Vec<String>,
+    pub probe_topo_order: Vec<String>,
+    target_graph: DiGraph<String, ()>,
+    tgt_to_node: HashMap<String, NodeIndex>,
 }
 
 impl DependencyGraph {
@@ -88,6 +91,42 @@ impl DependencyGraph {
             }
         }
 
+        // Validate depends_on is a DAG (no cycles) and compute topo order
+        let probe_topo_order = match toposort(&depends_on_graph, None) {
+            Ok(order) => order
+                .into_iter()
+                .map(|idx| depends_on_graph[idx].clone())
+                .collect(),
+            Err(cycle) => {
+                let node = &depends_on_graph[cycle.node_id()];
+                return Err(GantryError::Validation(format!(
+                    "depends_on has a cycle involving probe '{node}'"
+                )));
+            }
+        };
+
+        // Build and validate target depends_on DAG (no cycles) via petgraph
+        let mut target_graph = DiGraph::<String, ()>::new();
+        let mut tgt_to_node: HashMap<String, NodeIndex> = HashMap::new();
+        for tgt_name in config.targets.keys() {
+            let idx = target_graph.add_node(tgt_name.clone());
+            tgt_to_node.insert(tgt_name.clone(), idx);
+        }
+        for (tgt_name, tgt_config) in &config.targets {
+            let to_idx = tgt_to_node[tgt_name];
+            for dep in &tgt_config.depends_on {
+                if let Some(&from_idx) = tgt_to_node.get(dep) {
+                    target_graph.add_edge(from_idx, to_idx, ());
+                }
+            }
+        }
+        if let Err(cycle) = toposort(&target_graph, None) {
+            let node = &target_graph[cycle.node_id()];
+            return Err(GantryError::Validation(format!(
+                "target depends_on has a cycle involving target '{node}'"
+            )));
+        }
+
         // Validate all target probe references
         for (tgt_name, tgt_config) in &config.targets {
             for probe_str in &tgt_config.probes {
@@ -112,24 +151,17 @@ impl DependencyGraph {
             svc_to_node,
             probe_to_node,
             topo_order,
+            probe_topo_order,
+            target_graph,
+            tgt_to_node,
         })
     }
 
     /// Topological order of probes via depends_on graph.
     /// Returns probe keys (e.g., "db.port", "db.ready", "app.http") in dependency order:
     /// a probe's deps always come before the probe itself.
-    /// Cycles are handled by returning probes in whatever order petgraph gives.
-    pub fn probe_topo_order(&self) -> Vec<String> {
-        match toposort(&self.depends_on_graph, None) {
-            Ok(order) => order
-                .into_iter()
-                .map(|idx| self.depends_on_graph[idx].clone())
-                .collect(),
-            Err(_) => {
-                // Cycle — return all probes in arbitrary order
-                self.probe_to_node.keys().cloned().collect()
-            }
-        }
+    pub fn probe_topo_order(&self) -> &[String] {
+        &self.probe_topo_order
     }
 
     /// Group services into topo levels. Services in the same level have no
@@ -180,58 +212,92 @@ impl DependencyGraph {
     }
 
     /// Propagate state change downstream through depends_on edges (BFS).
-    /// Red source → dependents go Red; non-Red source → dependents go Stale.
-    /// Only affects Green dependents (and Stale dependents when propagating Red).
-    pub fn propagate_staleness(
+    /// Red source → dependents go Red; non-Red source → dependents go Pending.
+    /// Only affects Green dependents (and Pending dependents when propagating Red).
+    pub fn propagate_pending(
         &self,
         probe_key: &str,
         services: &mut IndexMap<String, ServiceRuntime>,
         changes: &mut Vec<(ProbeRef, ProbeState, ProbeState)>,
     ) {
         let mut queue = VecDeque::new();
+        let mut visited = HashSet::new();
         queue.push_back(probe_key.to_string());
+        visited.insert(probe_key.to_string());
+        // Track probes that are "effectively red" for propagation purposes,
+        // including stopped service probes whose state wasn't changed.
+        let mut effectively_red = HashSet::new();
+        if ProbeRef::parse(probe_key)
+            .and_then(|pr| {
+                services
+                    .get(&pr.service)?
+                    .probes
+                    .get(&pr.probe)
+                    .map(|p| p.state.is_red())
+            })
+            .unwrap_or(false)
+        {
+            effectively_red.insert(probe_key.to_string());
+        }
 
         while let Some(current) = queue.pop_front() {
-            // Determine what state to propagate from current node
-            let source_is_red = ProbeRef::parse(&current)
-                .and_then(|pr| {
-                    services
-                        .get(&pr.service)?
-                        .probes
-                        .get(&pr.probe)
-                        .map(|p| p.state.is_red())
-                })
-                .unwrap_or(false);
-
+            let source_is_red = effectively_red.contains(&current);
             let current_ref = ProbeRef::parse(&current).unwrap();
 
-            for dep_key in self.reverse_depends_on(&current) {
-                if let Some(probe_ref) = ProbeRef::parse(&dep_key)
-                    && let Some(svc) = services.get_mut(&probe_ref.service)
-                    && let Some(probe) = svc.probes.get_mut(&probe_ref.probe)
-                    && (probe.state.is_green() || (source_is_red && probe.state.is_stale()))
+            let Some(&node_idx) = self.probe_to_node.get(&current) else {
+                continue;
+            };
+            for neighbor_idx in self
+                .depends_on_graph
+                .neighbors_directed(node_idx, petgraph::Direction::Outgoing)
+            {
+                let dep_key = &self.depends_on_graph[neighbor_idx];
+                if !visited.insert(dep_key.clone()) {
+                    continue;
+                }
+                let Some(probe_ref) = ProbeRef::parse(dep_key) else {
+                    continue;
+                };
+                let Some(svc) = services.get_mut(&probe_ref.service) else {
+                    continue;
+                };
+                let svc_running = matches!(svc.state, ServiceState::Running);
+                if let Some(probe) = svc.probes.get_mut(&probe_ref.probe)
+                    && (probe.state.is_green() || (source_is_red && probe.state.is_pending()))
                 {
-                    let prev = probe.state.clone();
-                    probe.prev_color = Some(prev.color());
-                    let propagate_as = if source_is_red {
-                        ProbeState::Red(crate::model::RedReason::DepRed {
-                            dep: current_ref.clone(),
-                        })
-                    } else {
-                        ProbeState::Stale(crate::model::StaleReason::DepNotReady {
-                            dep: current_ref.clone(),
-                        })
-                    };
-                    probe.state = propagate_as.clone();
-                    tracing::debug!("[{dep_key}] {:?} (depends on {current})", propagate_as);
-                    changes.push((probe_ref, propagate_as, prev));
-                    queue.push_back(dep_key);
+                    if svc_running {
+                        let prev = probe.state.clone();
+                        probe.prev_color = Some(prev.color());
+                        let propagate_as = if source_is_red {
+                            ProbeState::Red(crate::model::RedReason::DepRed {
+                                dep: current_ref.clone(),
+                            })
+                        } else {
+                            ProbeState::Pending(crate::model::PendingReason::DepNotReady {
+                                dep: current_ref.clone(),
+                            })
+                        };
+                        probe.state = propagate_as.clone();
+                        tracing::debug!(
+                            "prb [{dep_key}] → {} (dep {current})",
+                            propagate_as.as_str()
+                        );
+                        if propagate_as.is_red() {
+                            effectively_red.insert(dep_key.clone());
+                        }
+                        changes.push((probe_ref, propagate_as, prev));
+                    } else if source_is_red {
+                        // Stopped service: don't change state but carry red-ness forward
+                        effectively_red.insert(dep_key.clone());
+                    }
+                    // Always continue walking through stopped services
+                    queue.push_back(dep_key.clone());
                 }
             }
         }
     }
 
-    /// Mark a probe as red and propagate staleness downstream.
+    /// Mark a probe as red and propagate pending downstream.
     /// Returns all (probe_ref, new_state, prev_color) changes.
     pub fn mark_red(
         &self,
@@ -251,11 +317,16 @@ impl DependencyGraph {
             probe.state = new_state.clone();
             changes.push((probe_ref.clone(), new_state, prev));
         }
-        self.propagate_staleness(&probe_key, services, changes);
+        self.propagate_pending(&probe_key, services, changes);
     }
 
-    /// Recovery propagation (BFS): when a probe goes green, mark non-stale
-    /// reverse-deps as stale — but only if the dependent has no other Red deps.
+    /// Recovery propagation: when a probe goes green, walk reverse dependents
+    /// and mark them Pending(DepRecovered) for re-checking.
+    ///
+    /// Green is transitive — if a dep fluctuated, all downstream must re-verify.
+    /// Skip: Pending (already queued), ProbeFailed (own failure), stopped services.
+    /// Recover: Green, Red(DepRed), Red(Stopped), Red(ContainerDied) on running services.
+    /// has_other_red guard prevents recovery when other deps are still blocking.
     pub fn propagate_recovery(
         &self,
         probe_key: &str,
@@ -263,42 +334,76 @@ impl DependencyGraph {
         changes: &mut Vec<(ProbeRef, ProbeState, ProbeState)>,
     ) {
         let mut queue = VecDeque::new();
+        let mut visited = HashSet::new();
         queue.push_back(probe_key.to_string());
+        visited.insert(probe_key.to_string());
 
         while let Some(current) = queue.pop_front() {
             let current_ref = ProbeRef::parse(&current).unwrap();
-            for dep_key in self.reverse_depends_on(&current) {
-                let Some(probe_ref) = ProbeRef::parse(&dep_key) else {
+
+            let Some(&node_idx) = self.probe_to_node.get(&current) else {
+                continue;
+            };
+            for neighbor_idx in self
+                .depends_on_graph
+                .neighbors_directed(node_idx, petgraph::Direction::Outgoing)
+            {
+                let dep_key = &self.depends_on_graph[neighbor_idx];
+                if !visited.insert(dep_key.clone()) {
+                    continue;
+                }
+                let Some(probe_ref) = ProbeRef::parse(dep_key) else {
                     continue;
                 };
-                // Keep it Red if another dep is still Red
-                let has_other_red = {
-                    let probe = &services[&probe_ref.service].probes[&probe_ref.probe];
-                    probe.depends_on.iter().any(|dep| {
+                // Read probe state + deps without holding mutable borrow
+                let (skip, svc_running, has_other_red) = {
+                    let Some(svc) = services.get(&probe_ref.service) else {
+                        continue;
+                    };
+                    let svc_running = matches!(svc.state, ServiceState::Running);
+                    let Some(probe) = svc.probes.get(&probe_ref.probe) else {
+                        continue;
+                    };
+                    // Skip Pending (already queued) and ProbeFailed (own failure)
+                    let skip = probe.state.is_pending() || probe.state.is_probe_failed();
+                    let has_other_red = probe.depends_on.iter().any(|dep| {
                         dep.to_string() != current
                             && services
                                 .get(&dep.service)
                                 .and_then(|s| s.probes.get(&dep.probe))
                                 .is_some_and(|p| p.state.is_red())
-                    })
+                    });
+                    (skip, svc_running, has_other_red)
                 };
+
+                if skip || !svc_running {
+                    continue;
+                }
                 if has_other_red {
                     continue;
                 }
-                if let Some(svc) = services.get_mut(&probe_ref.service)
-                    && let Some(probe) = svc.probes.get_mut(&probe_ref.probe)
-                    && !probe.state.is_stale()
-                {
-                    let prev = probe.state.clone();
-                    probe.prev_color = Some(prev.color());
-                    let new_state = ProbeState::Stale(crate::model::StaleReason::DepRecovered {
-                        dep: current_ref.clone(),
-                    });
-                    probe.state = new_state.clone();
-                    tracing::debug!("[{dep_key}] stale (dependency {current} recovered)");
-                    changes.push((probe_ref, new_state, prev));
-                    queue.push_back(dep_key);
-                }
+
+                // Recover: mark Pending(DepRecovered)
+                let svc = services.get_mut(&probe_ref.service).unwrap();
+                let probe = svc.probes.get_mut(&probe_ref.probe).unwrap();
+                let prev = probe.state.clone();
+
+                // Invariant: recovery must not overwrite ProbeFailed
+                debug_assert!(
+                    !prev.is_probe_failed(),
+                    "recovery propagation tried to overwrite ProbeFailed on {}",
+                    dep_key
+                );
+
+                probe.prev_color = Some(prev.color());
+                let new_state = ProbeState::Pending(crate::model::PendingReason::DepRecovered {
+                    dep: current_ref.clone(),
+                });
+                probe.state = new_state.clone();
+                tracing::debug!("prb [{dep_key}] → pending (dep {current} recovered)");
+                changes.push((probe_ref, new_state, prev));
+
+                queue.push_back(dep_key.clone());
             }
         }
     }
@@ -308,23 +413,19 @@ impl DependencyGraph {
     pub fn flatten_target(&self, target_name: &str, config: &GantryConfig) -> Vec<ProbeRef> {
         // Step 1: collect probes from target chain (BFS through target depends_on)
         let mut probes = Vec::new();
-        let mut visited_targets = HashSet::new();
-        let mut tgt_queue = VecDeque::new();
-        tgt_queue.push_back(target_name.to_string());
-        while let Some(tgt_name) = tgt_queue.pop_front() {
-            if !visited_targets.insert(tgt_name.clone()) {
-                continue;
-            }
-            if let Some(tgt) = config.targets.get(&tgt_name) {
-                for probe_str in &tgt.probes {
-                    if let Some(pr) = ProbeRef::parse(probe_str)
-                        && !probes.contains(&pr)
-                    {
-                        probes.push(pr);
+        if let Some(&start) = self.tgt_to_node.get(target_name) {
+            let reversed = petgraph::visit::Reversed(&self.target_graph);
+            let mut bfs = petgraph::visit::Bfs::new(&reversed, start);
+            while let Some(node) = bfs.next(&reversed) {
+                let tgt_name = &self.target_graph[node];
+                if let Some(tgt) = config.targets.get(tgt_name) {
+                    for probe_str in &tgt.probes {
+                        if let Some(pr) = ProbeRef::parse(probe_str)
+                            && !probes.contains(&pr)
+                        {
+                            probes.push(pr);
+                        }
                     }
-                }
-                for dep_tgt in &tgt.depends_on {
-                    tgt_queue.push_back(dep_tgt.clone());
                 }
             }
         }
@@ -348,6 +449,70 @@ impl DependencyGraph {
             }
         }
         probes
+    }
+
+    /// Set initial probe states after docker inspect discovers running containers.
+    /// Walks services in topo order (start_after). For running services whose
+    /// start_after deps are all running, probes become Pending(Unchecked) so they
+    /// get reprobed. Otherwise probes stay Red.
+    pub fn initialize_probe_states(&self, services: &mut IndexMap<String, ServiceRuntime>) {
+        use crate::model::{PendingReason, ProbeState, RedReason, ServiceState};
+
+        // Walk in topo order so we process dependencies before dependents
+        for svc_name in &self.topo_order {
+            let svc_state = services[svc_name].state;
+            if svc_state != ServiceState::Running {
+                // Stopped/Crashed: probes stay Red(Stopped) as initialized
+                continue;
+            }
+
+            // Check if all start_after deps are running
+            let all_deps_running = {
+                let svc = &services[svc_name];
+                svc.start_after.iter().all(|dep_ref| {
+                    services
+                        .get(&dep_ref.service)
+                        .is_some_and(|dep_svc| dep_svc.state == ServiceState::Running)
+                })
+            };
+
+            if !all_deps_running {
+                // Service is running but a dependency is stopped/crashed — probes stay Red
+                continue;
+            }
+
+            // Mark probes as Pending(Unchecked), but respect probe-level depends_on:
+            // if a probe's depends_on points to a red probe, keep it Red(DepRed).
+            let probe_names: Vec<String> = services[svc_name].probes.keys().cloned().collect();
+            for probe_name in probe_names {
+                // Collect deps and find first red dep before mutating
+                let first_red_dep = {
+                    let probe = &services[svc_name].probes[&probe_name];
+                    probe
+                        .depends_on
+                        .iter()
+                        .find(|dep_ref| {
+                            services
+                                .get(&dep_ref.service)
+                                .and_then(|s| s.probes.get(&dep_ref.probe))
+                                .is_some_and(|p| p.state.is_red())
+                        })
+                        .cloned()
+                };
+
+                let probe = services
+                    .get_mut(svc_name)
+                    .unwrap()
+                    .probes
+                    .get_mut(&probe_name)
+                    .unwrap();
+                if let Some(dep) = first_red_dep {
+                    probe.state = ProbeState::Red(RedReason::DepRed { dep });
+                } else {
+                    probe.state = ProbeState::Pending(PendingReason::Unchecked);
+                }
+            }
+        }
     }
 }
 
@@ -427,6 +592,56 @@ targets:
     }
 
     #[test]
+    fn detect_depends_on_cycle() {
+        let yaml = r#"
+services:
+  a:
+    container: a
+    probes:
+      x:
+        probe: { type: tcp, port: 1, timeout: 1s }
+        depends_on: [a.y]
+      y:
+        probe: { type: tcp, port: 2, timeout: 1s }
+        depends_on: [a.x]
+targets:
+  t:
+    probes: [a.x]
+"#;
+        let config: GantryConfig = serde_yaml::from_str(yaml).unwrap();
+        let err = DependencyGraph::build(&config).err().expect("should fail");
+        assert!(
+            err.to_string().contains("depends_on has a cycle"),
+            "expected depends_on cycle error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn detect_target_depends_on_cycle() {
+        let yaml = r#"
+services:
+  a:
+    container: a
+    probes:
+      ready:
+        probe: { type: meta }
+targets:
+  t1:
+    probes: [a.ready]
+    depends_on: [t2]
+  t2:
+    probes: [a.ready]
+    depends_on: [t1]
+"#;
+        let config: GantryConfig = serde_yaml::from_str(yaml).unwrap();
+        let err = DependencyGraph::build(&config).err().expect("should fail");
+        assert!(
+            err.to_string().contains("target depends_on has a cycle"),
+            "expected target cycle error, got: {err}"
+        );
+    }
+
+    #[test]
     fn flatten_target_with_deps() {
         let yaml = r#"
 services:
@@ -458,13 +673,14 @@ targets:
     }
 
     #[test]
-    fn staleness_propagation() {
+    fn pending_propagation() {
         let config = test_config();
         let graph = DependencyGraph::build(&config).unwrap();
         let mut state = crate::model::RuntimeState::from_config(&config);
 
-        // Set everything to green
+        // Set everything to running + green
         for svc in state.services.values_mut() {
+            svc.state = crate::model::ServiceState::Running;
             for probe in svc.probes.values_mut() {
                 probe.state = ProbeState::Green;
             }
@@ -491,28 +707,19 @@ targets:
         let graph = DependencyGraph::build(&config).unwrap();
         let mut state = crate::model::RuntimeState::from_config(&config);
 
-        // Set everything to green
+        // Set everything to running + green
         for svc in state.services.values_mut() {
+            svc.state = crate::model::ServiceState::Running;
             for probe in svc.probes.values_mut() {
                 probe.state = ProbeState::Green;
             }
         }
 
-        // Mark db.port as red (simulates stop) → propagates stale downstream
+        // Mark db.port as red (simulates stop) → propagates pending downstream
         let db_port = ProbeRef::new("db", "port");
         let mut changes = Vec::new();
         graph.mark_red(&db_port, &mut state.services, &mut changes);
         assert!(state.services["app"].probes["http"].state.is_red());
-
-        // Simulate: app.http reprobed while dep is red → stays red
-        state
-            .services
-            .get_mut("app")
-            .unwrap()
-            .probes
-            .get_mut("http")
-            .unwrap()
-            .state = ProbeState::Red(crate::model::RedReason::Stopped);
 
         // Now db.port recovers to green → recovery propagation
         state
@@ -526,10 +733,7 @@ targets:
         let mut recovery = Vec::new();
         graph.propagate_recovery("db.port", &mut state.services, &mut recovery);
 
-        // db.ready was stale → now stale (no change, skipped)
-        // But it was stale from mark_red, so propagate_recovery skips it (already stale)
-
-        // Reset app.http to red (simulating it was reprobed and failed)
+        // Reset app.http to Red(DepRed) — simulating dep chain still blocked
         state
             .services
             .get_mut("app")
@@ -537,7 +741,9 @@ targets:
             .probes
             .get_mut("http")
             .unwrap()
-            .state = ProbeState::Red(crate::model::RedReason::Stopped);
+            .state = ProbeState::Red(crate::model::RedReason::DepRed {
+            dep: ProbeRef::new("db", "ready"),
+        });
 
         // Simulate db.ready also recovers
         state
@@ -551,44 +757,36 @@ targets:
         let mut recovery2 = Vec::new();
         graph.propagate_recovery("db.ready", &mut state.services, &mut recovery2);
 
-        // app.http was red → now stale (recovery propagation)
-        assert!(state.services["app"].probes["http"].state.is_stale());
+        // app.http was red → now pending (recovery propagation)
+        assert!(state.services["app"].probes["http"].state.is_pending());
         assert!(
             recovery2
                 .iter()
-                .any(|(pr, new, _)| pr.to_string() == "app.http" && new.is_stale())
+                .any(|(pr, new, _)| pr.to_string() == "app.http" && new.is_pending())
         );
     }
 
     #[test]
-    fn recovery_propagation_green_dependents() {
+    fn recovery_invalidates_green_dependents() {
+        // Green is transitive — if a dep recovered, all downstream must re-verify.
         let config = test_config();
         let graph = DependencyGraph::build(&config).unwrap();
         let mut state = crate::model::RuntimeState::from_config(&config);
 
-        // Everything green
+        // Everything running + green
         for svc in state.services.values_mut() {
+            svc.state = crate::model::ServiceState::Running;
             for probe in svc.probes.values_mut() {
                 probe.state = ProbeState::Green;
             }
         }
 
-        // db.port goes red then recovers
-        state
-            .services
-            .get_mut("db")
-            .unwrap()
-            .probes
-            .get_mut("port")
-            .unwrap()
-            .state = ProbeState::Green;
         let mut changes = Vec::new();
         graph.propagate_recovery("db.port", &mut state.services, &mut changes);
 
-        // db.ready was green → now stale (green dependents also staled)
-        assert!(state.services["db"].probes["ready"].state.is_stale());
-        // app.http was green → now stale (transitive)
-        assert!(state.services["app"].probes["http"].state.is_stale());
+        // Green dependents become pending — dep fluctuated, must re-verify
+        assert!(state.services["db"].probes["ready"].state.is_pending());
+        assert!(state.services["app"].probes["http"].state.is_pending());
     }
 
     #[test]
@@ -687,10 +885,10 @@ targets:
     }
 
     #[test]
-    fn propagate_staleness_only_from_non_green() {
-        // Callers must only call propagate_staleness for probes that are NOT green.
+    fn propagate_pending_only_from_non_green() {
+        // Callers must only call propagate_pending for probes that are NOT green.
         // This test verifies the converge pattern: after restart, only propagate
-        // from probes that are still stale/red, not from green ones.
+        // from probes that are still pending/red, not from green ones.
         let config = demo_config();
         let graph = DependencyGraph::build(&config).unwrap();
         let mut state = crate::model::RuntimeState::from_config(&config);
@@ -713,7 +911,7 @@ targets:
             .collect();
         let mut changes = Vec::new();
         for probe_key in &non_green {
-            graph.propagate_staleness(probe_key, &mut state.services, &mut changes);
+            graph.propagate_pending(probe_key, &mut state.services, &mut changes);
         }
 
         // Nothing should change — all probes are green, no propagation needed.
@@ -722,8 +920,8 @@ targets:
     }
 
     #[test]
-    fn propagate_staleness_from_red_probe_stales_dependents() {
-        // When a probe goes red, its green dependents should go stale.
+    fn propagate_pending_from_red_probe_marks_dependents_pending() {
+        // When a probe goes red, its green dependents should go pending.
         let config = demo_config();
         let graph = DependencyGraph::build(&config).unwrap();
         let mut state = crate::model::RuntimeState::from_config(&config);
@@ -735,7 +933,7 @@ targets:
             }
         }
 
-        // web.http goes red — propagate staleness
+        // web.http goes red — propagate pending
         state
             .services
             .get_mut("web")
@@ -745,7 +943,7 @@ targets:
             .unwrap()
             .state = ProbeState::Red(crate::model::RedReason::Stopped);
         let mut changes = Vec::new();
-        graph.propagate_staleness("web.http", &mut state.services, &mut changes);
+        graph.propagate_pending("web.http", &mut state.services, &mut changes);
 
         // web.ready (depends on web.http, was green) → now RED (source is Red)
         assert!(state.services["web"].probes["ready"].state.is_red());
@@ -846,7 +1044,7 @@ targets:
             }
         }
 
-        // Mark web.http as stale (simulating it was red then its dep recovered)
+        // Mark web.http as red (simulating it was red then its dep recovered)
         state
             .services
             .get_mut("web")
@@ -854,7 +1052,9 @@ targets:
             .probes
             .get_mut("http")
             .unwrap()
-            .state = ProbeState::Red(crate::model::RedReason::Stopped);
+            .state = ProbeState::Red(crate::model::RedReason::DepRed {
+            dep: ProbeRef::new("db", "ready"),
+        });
 
         // web.http recovers to green → propagate_recovery
         state
@@ -868,8 +1068,8 @@ targets:
         let mut changes = Vec::new();
         graph.propagate_recovery("web.http", &mut state.services, &mut changes);
 
-        // web.ready should be stale (depends on web.http)
-        assert!(state.services["web"].probes["ready"].state.is_stale());
+        // web.ready should be pending (depends on web.http)
+        assert!(state.services["web"].probes["ready"].state.is_pending());
 
         // app.ready should NOT be affected (doesn't depend on web.http)
         assert!(state.services["app"].probes["ready"].state.is_green());
@@ -878,22 +1078,21 @@ targets:
     }
 
     #[test]
-    fn all_stale_then_resolve_in_topo_order() {
-        // Simulates reprobe-all: everything stale, probes all pass, resolve in topo order
+    fn all_pending_then_resolve_in_topo_order() {
+        // Simulates reprobe-all: everything pending, probes all pass, resolve in topo order
         let config = demo_config();
         let graph = DependencyGraph::build(&config).unwrap();
         let mut state = crate::model::RuntimeState::from_config(&config);
 
-        // Set everything running + stale (simulates force reprobe-all)
+        // Set everything running + pending (simulates force reprobe-all)
         for svc in state.services.values_mut() {
             svc.state = crate::model::ServiceState::Running;
             for probe in svc.probes.values_mut() {
-                probe.state = ProbeState::Stale(crate::model::StaleReason::Reprobing);
+                probe.state = ProbeState::Pending(crate::model::PendingReason::Reprobing);
             }
         }
 
         // Simulate: all probes pass, resolve in topo order
-        // Topo levels: [db, redis] then [web, app]
         let all_svcs: Vec<String> = state.services.keys().cloned().collect();
         let levels = graph.topo_levels(&all_svcs);
 
@@ -903,10 +1102,10 @@ targets:
                 let probe_names: Vec<String> = svc.probes.keys().cloned().collect();
                 for probe_name in &probe_names {
                     let probe = &state.services[svc_name].probes[probe_name];
-                    if matches!(probe.probe_config, crate::config::ProbeConfig::Meta) {
+                    if probe.is_meta() {
                         continue; // Meta probes resolved by separate step
                     }
-                    // "Probe passes" — check deps to determine state
+                    // "Probe passes" -- check deps to determine state
                     let deps_all_green = probe.depends_on.iter().all(|dep| {
                         state
                             .services
@@ -917,7 +1116,7 @@ targets:
                     let new_state = if deps_all_green {
                         ProbeState::Green
                     } else {
-                        ProbeState::Stale(crate::model::StaleReason::DepNotReady {
+                        ProbeState::Pending(crate::model::PendingReason::DepNotReady {
                             dep: probe
                                 .depends_on
                                 .first()
@@ -947,7 +1146,7 @@ targets:
                 // Resolve meta probes
                 for probe_name in &probe_names {
                     let probe = &state.services[svc_name].probes[probe_name];
-                    if !matches!(probe.probe_config, crate::config::ProbeConfig::Meta) {
+                    if !probe.is_meta() {
                         continue;
                     }
                     let satisfied = crate::probe::meta::is_satisfied(
@@ -994,8 +1193,8 @@ targets:
     }
 
     #[test]
-    fn red_propagates_to_stale_dependents() {
-        // If app.http is stale and db.ready goes red, app.http should go red (not stay stale)
+    fn red_propagates_to_pending_dependents() {
+        // If app.http is pending and db.ready goes red, app.http should go red (not stay pending)
         let yaml = r#"
 services:
   db:
@@ -1019,7 +1218,7 @@ targets:
         for (_, svc) in state.services.iter_mut() {
             svc.state = ServiceState::Running;
         }
-        // Set app.http to stale, db.ready to green
+        // Set app.http to pending, db.ready to green
         state
             .services
             .get_mut("app")
@@ -1027,7 +1226,7 @@ targets:
             .probes
             .get_mut("http")
             .unwrap()
-            .state = ProbeState::Stale(crate::model::StaleReason::Reprobing);
+            .state = ProbeState::Pending(crate::model::PendingReason::Reprobing);
         state
             .services
             .get_mut("db")
@@ -1045,10 +1244,10 @@ targets:
             &mut changes,
         );
 
-        // app.http was stale, dep went red → should now be red
+        // app.http was pending, dep went red → should now be red
         assert!(
             state.services["app"].probes["http"].state.is_red(),
-            "stale probe with red dep should become red"
+            "pending probe with red dep should become red"
         );
     }
 
@@ -1056,7 +1255,7 @@ targets:
     fn recovery_blocked_by_other_red_dep() {
         // app.http depends on db.ready AND redis.port.
         // db.ready recovers, but redis.port is still red.
-        // app.http should stay red (not go stale).
+        // app.http should stay red (not go pending).
         let yaml = r#"
 services:
   db:
@@ -1109,6 +1308,114 @@ targets:
             state.services["app"].probes["http"].state.is_red(),
             "should stay red when another dep is still red"
         );
+    }
+
+    // ── initialize_probe_states tests ──
+
+    #[test]
+    fn init_probes_all_running_no_deps() {
+        // db and redis have no start_after deps, both running → probes become Pending(Unchecked)
+        let config = demo_config();
+        let graph = DependencyGraph::build(&config).unwrap();
+        let mut state = crate::model::RuntimeState::from_config(&config);
+        for svc in state.services.values_mut() {
+            svc.state = ServiceState::Running;
+        }
+        graph.initialize_probe_states(&mut state.services);
+        // All probes should be Pending(Unchecked)
+        for (svc_name, svc) in &state.services {
+            for (probe_name, probe) in &svc.probes {
+                assert!(
+                    probe.state.is_pending(),
+                    "{svc_name}.{probe_name} should be pending but is {:?}",
+                    probe.state
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn init_probes_stopped_service_stays_red() {
+        let config = demo_config();
+        let graph = DependencyGraph::build(&config).unwrap();
+        let mut state = crate::model::RuntimeState::from_config(&config);
+        // Leave all services stopped (default)
+        graph.initialize_probe_states(&mut state.services);
+        for (svc_name, svc) in &state.services {
+            for (probe_name, probe) in &svc.probes {
+                assert!(
+                    probe.state.is_red(),
+                    "{svc_name}.{probe_name} should be red but is {:?}",
+                    probe.state
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn init_probes_running_with_stopped_dep() {
+        // web depends on db (start_after: [db.ready]).
+        // db is stopped, web is running → web probes stay Red
+        let config = demo_config();
+        let graph = DependencyGraph::build(&config).unwrap();
+        let mut state = crate::model::RuntimeState::from_config(&config);
+        // Only web is running, db is stopped
+        state.services.get_mut("web").unwrap().state = ServiceState::Running;
+        graph.initialize_probe_states(&mut state.services);
+        for (probe_name, probe) in &state.services["web"].probes {
+            assert!(
+                probe.state.is_red(),
+                "web.{probe_name} should be red (dep db is stopped) but is {:?}",
+                probe.state
+            );
+        }
+    }
+
+    #[test]
+    fn init_probes_partial_running() {
+        // db running, redis stopped, web running (depends on db), app running (depends on db+redis)
+        // web probes → Pending (db is running)
+        // app probes → Red (redis is stopped, app start_after includes redis.ready)
+        let config = demo_config();
+        let graph = DependencyGraph::build(&config).unwrap();
+        let mut state = crate::model::RuntimeState::from_config(&config);
+        state.services.get_mut("db").unwrap().state = ServiceState::Running;
+        state.services.get_mut("web").unwrap().state = ServiceState::Running;
+        state.services.get_mut("app").unwrap().state = ServiceState::Running;
+        // redis stays Stopped
+        graph.initialize_probe_states(&mut state.services);
+
+        // db probes: pending (running, no deps)
+        for probe in state.services["db"].probes.values() {
+            assert!(probe.state.is_pending(), "db probe should be pending");
+        }
+        // web.http depends on db.ready which is pending (not red) → web.http should be pending
+        // Actually wait — web's start_after deps are all running (db), so web probes can be pending.
+        // But web.http depends_on db.ready, and db.ready is pending, not red.
+        // Our logic only keeps probes Red if a dep is red, otherwise Pending(Unchecked).
+        // Pending dep is fine — the probe will get reprobed anyway.
+        for probe in state.services["web"].probes.values() {
+            assert!(probe.state.is_pending(), "web probe should be pending");
+        }
+        // app: start_after includes redis.ready, redis is stopped → probes stay Red
+        for (probe_name, probe) in &state.services["app"].probes {
+            assert!(
+                probe.state.is_red(),
+                "app.{probe_name} should be red (redis stopped)"
+            );
+        }
+    }
+
+    #[test]
+    fn init_probes_crashed_stays_red() {
+        let config = demo_config();
+        let graph = DependencyGraph::build(&config).unwrap();
+        let mut state = crate::model::RuntimeState::from_config(&config);
+        state.services.get_mut("db").unwrap().state = ServiceState::Crashed;
+        graph.initialize_probe_states(&mut state.services);
+        for probe in state.services["db"].probes.values() {
+            assert!(probe.state.is_red(), "crashed service probe should be red");
+        }
     }
 
     #[test]
@@ -1170,10 +1477,196 @@ targets:
             .state = ProbeState::Red(crate::model::RedReason::Stopped);
 
         // full target should not be green (infra dep is red)
-        let full_state = state.targets["full"].state(&state.services);
+        let full_state = state.targets["full"].state(&state.services, &state.targets);
         assert!(
             !full_state.is_green(),
             "target should not be green when dependent target's probes are red"
+        );
+    }
+
+    #[test]
+    fn propagation_walks_through_stopped_service() {
+        // db (stopped) → db.ready → app.http (running)
+        // Stopping db should propagate red to app.http even though db is stopped.
+        let config = test_config();
+        let graph = DependencyGraph::build(&config).unwrap();
+        let mut state = crate::model::RuntimeState::from_config(&config);
+
+        // Both services running + green
+        for svc in state.services.values_mut() {
+            svc.state = ServiceState::Running;
+            for probe in svc.probes.values_mut() {
+                probe.state = ProbeState::Green;
+            }
+        }
+
+        // Stop db — mark its probes red
+        state.services.get_mut("db").unwrap().state = ServiceState::Stopped;
+        state
+            .services
+            .get_mut("db")
+            .unwrap()
+            .probes
+            .get_mut("port")
+            .unwrap()
+            .state = ProbeState::Red(crate::model::RedReason::Stopped);
+
+        // Propagate from db.port — should walk through db.ready (stopped) to reach app.http (running)
+        let mut changes = Vec::new();
+        graph.propagate_pending("db.port", &mut state.services, &mut changes);
+
+        // app.http must be red — the propagation walked through stopped db.ready
+        assert!(
+            state.services["app"].probes["http"].state.is_red(),
+            "app.http should be red: propagation must walk through stopped service probes"
+        );
+        // app.ready depends on app.http → also red
+        assert!(
+            state.services["app"].probes["ready"].state.is_red(),
+            "app.ready should be red transitively"
+        );
+        // db.ready state should NOT be changed (db is stopped)
+        assert!(
+            state.services["db"].probes["ready"].state.is_green(),
+            "stopped service probe state should not be modified"
+        );
+    }
+
+    #[test]
+    fn recovery_skips_stopped_services() {
+        // db is stopped, db.port recovers. Recovery should NOT cross into
+        // stopped db — db.ready is on a stopped service, skip it.
+        // app.http stays Red(DepRed) because db.ready is still Red(Stopped).
+        // The has_other_red guard handles this correctly.
+        let config = test_config();
+        let graph = DependencyGraph::build(&config).unwrap();
+        let mut state = crate::model::RuntimeState::from_config(&config);
+
+        for svc in state.services.values_mut() {
+            svc.state = ServiceState::Running;
+        }
+        state.services.get_mut("db").unwrap().state = ServiceState::Stopped;
+
+        for probe in state.services.get_mut("db").unwrap().probes.values_mut() {
+            probe.state = ProbeState::Red(crate::model::RedReason::Stopped);
+        }
+        state
+            .services
+            .get_mut("app")
+            .unwrap()
+            .probes
+            .get_mut("http")
+            .unwrap()
+            .state = ProbeState::Red(crate::model::RedReason::DepRed {
+            dep: ProbeRef::new("db", "ready"),
+        });
+
+        // db.port recovers
+        state
+            .services
+            .get_mut("db")
+            .unwrap()
+            .probes
+            .get_mut("port")
+            .unwrap()
+            .state = ProbeState::Green;
+        let mut changes = Vec::new();
+        graph.propagate_recovery("db.port", &mut state.services, &mut changes);
+
+        // app.http stays Red — db.ready is still Red(Stopped), recovery skipped stopped service
+        assert!(
+            state.services["app"].probes["http"].state.is_red(),
+            "app.http should stay red — db is still stopped"
+        );
+        assert!(
+            changes.is_empty(),
+            "no changes — recovery can't cross stopped service"
+        );
+    }
+
+    #[test]
+    fn log_since_not_advanced_on_propagation() {
+        // log_since is only advanced on service restart (start.rs), not during
+        // dep propagation. A running service's log output is still valid even
+        // if a dependency goes red — the probe state (Red/DepRed) already
+        // captures the dep failure. Reprobe can match existing logs.
+        let config = test_config();
+        let graph = DependencyGraph::build(&config).unwrap();
+        let mut state = crate::model::RuntimeState::from_config(&config);
+
+        for svc in state.services.values_mut() {
+            svc.state = ServiceState::Running;
+            for probe in svc.probes.values_mut() {
+                probe.state = ProbeState::Green;
+            }
+        }
+
+        let app_log_since_before = state.services["app"].log_since;
+
+        // Stop db, mark db.port red, propagate
+        state.services.get_mut("db").unwrap().state = ServiceState::Stopped;
+        state
+            .services
+            .get_mut("db")
+            .unwrap()
+            .probes
+            .get_mut("port")
+            .unwrap()
+            .state = ProbeState::Red(crate::model::RedReason::Stopped);
+        let mut changes = Vec::new();
+        graph.propagate_pending("db.port", &mut state.services, &mut changes);
+
+        // app's log_since must NOT be advanced — only restart advances it
+        assert_eq!(
+            state.services["app"].log_since, app_log_since_before,
+            "propagation should not advance log_since"
+        );
+    }
+
+    #[test]
+    fn recovery_does_not_overwrite_probe_failed() {
+        // app.http depends on db.ready. Both are on running services.
+        // app.http fails its probe check → Red(ProbeFailed).
+        // db.ready recovers → propagate_recovery should NOT overwrite app.http
+        // because it failed for its own reason, not because of db.
+        let config = test_config();
+        let graph = DependencyGraph::build(&config).unwrap();
+        let mut state = crate::model::RuntimeState::from_config(&config);
+
+        for svc in state.services.values_mut() {
+            svc.state = crate::model::ServiceState::Running;
+            for probe in svc.probes.values_mut() {
+                probe.state = ProbeState::Green;
+            }
+        }
+
+        // app.http fails its own probe check
+        state
+            .services
+            .get_mut("app")
+            .unwrap()
+            .probes
+            .get_mut("http")
+            .unwrap()
+            .state = ProbeState::Red(crate::model::RedReason::ProbeFailed(
+            crate::model::ProbeFailure {
+                error: "connection refused".into(),
+                duration_ms: 100,
+            },
+        ));
+
+        // db.ready recovers → propagate recovery
+        let mut changes = Vec::new();
+        graph.propagate_recovery("db.ready", &mut state.services, &mut changes);
+
+        // app.http must STILL be Red(ProbeFailed) — recovery can't fix a probe's own failure
+        assert!(
+            matches!(
+                state.services["app"].probes["http"].state,
+                ProbeState::Red(crate::model::RedReason::ProbeFailed(_))
+            ),
+            "recovery propagation must not overwrite ProbeFailed: got {:?}",
+            state.services["app"].probes["http"].state
         );
     }
 }

@@ -44,6 +44,7 @@ pub async fn probe_tcp(
                     },
                     attempts,
                     matched_lines: Vec::new(),
+                    generation: 0,
                 };
             }
             Ok(Err(e)) => {
@@ -82,5 +83,6 @@ pub async fn probe_tcp(
         },
         attempts,
         matched_lines: Vec::new(),
+        generation: 0,
     }
 }

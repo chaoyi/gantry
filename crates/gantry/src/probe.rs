@@ -37,6 +37,9 @@ pub struct ProbeOutcome {
     pub attempts: Vec<ProbeAttempt>,
     /// Log lines that matched success/failure patterns (for UI display).
     pub matched_lines: Vec<String>,
+    /// Service generation at probe dispatch time.
+    /// Used to discard stale results when the service has been restarted.
+    pub generation: u64,
 }
 
 impl ProbeAttempt {
@@ -64,6 +67,7 @@ impl ProbeOutcome {
             result,
             attempts: Vec::new(),
             matched_lines: Vec::new(),
+            generation: u64::MAX,
         }
     }
 
@@ -79,6 +83,7 @@ impl ProbeOutcome {
             attempts: vec![ProbeAttempt::new(1, ok, ms, err, detail.to_string())],
             result,
             matched_lines: Vec::new(),
+            generation: u64::MAX,
         }
     }
 
@@ -141,6 +146,7 @@ pub async fn run_single_attempt(
     container_name: &str,
     probe_config: &ProbeConfig,
     timeout: Duration,
+    log_since: i64,
 ) -> ProbeOutcome {
     match probe_config {
         ProbeConfig::Tcp { host, port, .. } => {
@@ -171,14 +177,14 @@ pub async fn run_single_attempt(
         ProbeConfig::Log {
             success, failure, ..
         } => {
-            // Reprobe: scan all logs without following — checks current state
+            // Reprobe: scan logs since last known good point — avoids matching old data
             let (result, matched) = log::probe_log(
                 docker,
                 container_name,
                 success,
                 failure.as_deref(),
                 Duration::ZERO,
-                0,
+                log_since,
                 false,
             )
             .await;
@@ -190,7 +196,13 @@ pub async fn run_single_attempt(
 }
 
 fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max { s } else { &s[..max] }
+    if s.len() <= max {
+        s
+    } else {
+        // Find a char boundary at or before `max` to avoid panicking on multi-byte UTF-8
+        let end = s.floor_char_boundary(max);
+        &s[..end]
+    }
 }
 
 pub struct BackoffIter {

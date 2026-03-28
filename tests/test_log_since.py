@@ -6,9 +6,8 @@ import pytest
 
 
 @pytest.mark.slow
-def test_log_probe_after_disruption(demo):
+def test_log_probe_after_disruption(demo, green):
     """After disruption, log probe finds failure (not old success from boot)."""
-    demo.ensure_green()
     demo.stop('postgres')
     time.sleep(10)  # wait for stuck-svc to enter broken state
 

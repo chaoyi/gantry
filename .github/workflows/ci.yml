@@ -14,18 +14,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: docker/setup-buildx-action@v3
+      # Build debug image with checks (fmt, clippy, test) — one compilation
+      - uses: docker/build-push-action@v5
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+          context: .
+          build-args: |
+            PROFILE=dev
+            CHECK=true
+          load: true
+          tags: ghcr.io/chaoyi/gantry:latest
+          cache-from: type=gha,scope=debug
+          cache-to: type=gha,scope=debug,mode=max
+      # CUE checks (separate — not in Docker)
       - uses: cue-lang/setup-cue@v1.0.1
         with:
           version: v0.16.0
-      - run: cargo fmt --check
-      - run: cargo clippy -- -D warnings
-      - run: cargo test --lib
       - run: cue vet ./...
         working-directory: cue
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Generate and verify sample
         run: |
           cargo build -p gantry-cue
@@ -36,11 +44,8 @@ jobs:
           test -f output/demo/docker-compose.yml
           test -f output/demo/gantry.yaml
           grep -q "probes:" output/demo/gantry.yaml
-          # Verify templated filename rendered
           test -f output/demo/services/app/config-development.toml
-          # Verify volumes in compose
           grep -q "volumes:" output/demo/docker-compose.yml
-          # Verify command in compose
           grep -q "command:" output/demo/docker-compose.yml
 
   e2e:
@@ -50,9 +55,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
-      - name: Build and start
+      # Reuse debug image from check's GHA cache — no recompilation
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          build-args: PROFILE=dev
+          load: true
+          tags: ghcr.io/chaoyi/gantry:latest
+          cache-from: type=gha,scope=debug
+      - name: Build demo services and start
         run: |
-          docker buildx build --load --cache-from type=gha --cache-to type=gha,mode=max -t ghcr.io/chaoyi/gantry:latest .
           cd tests/fixtures/demo
           docker compose build
           docker compose up --no-start

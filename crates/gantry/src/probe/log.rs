@@ -42,10 +42,15 @@ pub async fn probe_log(
 
     let failure_re = failure_pattern.and_then(|p| Regex::new(p).ok());
 
+    tracing::debug!(
+        "prb log {container}: since={since} success={success_pattern:?} failure={failure_pattern:?} follow={follow}"
+    );
+
     if follow {
         // Phase 1: Scan existing logs (last match wins)
         let (scan_result, scan_lines) =
             scan_logs(docker, container, &success_re, failure_re.as_ref(), since).await;
+        tracing::debug!("prb log {container}: scan_result={scan_result:?} lines={scan_lines:?}");
 
         if let Some(ok) = scan_result {
             let elapsed = start.elapsed().as_millis() as u64;

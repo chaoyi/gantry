@@ -179,6 +179,21 @@ pub fn parse_duration(s: &str) -> std::result::Result<Duration, String> {
     }
 }
 
+impl ProbeConfig {
+    /// Human-readable probe type string for display (e.g. "tcp:5432", "log", "meta").
+    pub fn display_type(&self) -> String {
+        match self {
+            Self::Tcp { port, .. } => format!("tcp:{port}"),
+            Self::Log { .. } => "log".into(),
+            Self::Meta => "meta".into(),
+        }
+    }
+
+    pub fn is_meta(&self) -> bool {
+        matches!(self, Self::Meta)
+    }
+}
+
 impl ServiceConfig {
     pub fn restart_on_fail(&self, defaults: &DefaultsConfig) -> bool {
         self.restart_on_fail.unwrap_or(defaults.restart_on_fail)

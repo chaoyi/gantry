@@ -2,10 +2,11 @@
 # CRASH: exits when dependency is lost
 DEP_HOST=${DEP_HOST:-redis}
 DEP_PORT=${DEP_PORT:-6379}
+trap 'kill $PID 2>/dev/null; exit 0' TERM
 
 while ! nc -z "$DEP_HOST" "$DEP_PORT" 2>/dev/null; do
   echo "crash-svc: waiting for $DEP_HOST:$DEP_PORT"
-  sleep 1
+  sleep 1 & wait $!
 done
 echo "crash-svc: dependency connected"
 
@@ -16,5 +17,5 @@ while kill -0 $PID 2>/dev/null; do
     echo "crash-svc: dependency lost"
     exit 1
   fi
-  sleep 2
+  sleep 2 & wait $!
 done

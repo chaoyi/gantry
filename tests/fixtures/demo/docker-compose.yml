@@ -1,10 +1,10 @@
-# Demo: 6 services testing 4 converge recovery behaviors
+# Demo: 8 services in 2 isolated groups
 #
-# Infrastructure: postgres, redis
-# crash-svc:  exits when redis goes down (restart_on_fail: true)
-# stuck-svc:  stays running but broken when postgres goes down (restart_on_fail: true)
-# slow-heal:  reconnects to redis but takes ~20s (restart_on_fail: true — restart is faster)
-# fast-heal:  reconnects to postgres in ~2s (restart_on_fail: false)
+# Group 1 (targets: infra, app) — recovery behaviors:
+#   postgres, redis, crash-svc, stuck-svc, slow-heal, fast-heal
+#
+# Group 2 (targets: flaky-api-target, unstable) — converge failure:
+#   flaky-api (crashes randomly), doomed (stops responding, restart_on_fail=false)
 
 services:
   gantry:
@@ -12,6 +12,8 @@ services:
     build:
       context: ../../..
       dockerfile: Dockerfile
+      args:
+        PROFILE: dev
     container_name: demo-gantry
     environment:
       RUST_LOG: gantry=debug
@@ -47,3 +49,11 @@ services:
   fast-heal:
     build: ./fast-heal
     container_name: demo-fast-heal
+
+  flaky-api:
+    build: ./flaky-api
+    container_name: demo-flaky-api
+
+  doomed:
+    build: ./doomed
+    container_name: demo-doomed

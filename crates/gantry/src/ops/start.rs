@@ -4,7 +4,7 @@ use crate::api::AppState;
 use crate::config::ProbeConfig;
 use crate::error::{GantryError, Result};
 use crate::events::Event;
-use crate::model::{ProbeRef, ServiceState};
+use crate::model::{ProbeRef, ProbeState, ServiceState};
 use crate::ops::{OpActions, OpResponse, ProbeStatus, emit_target_states, resolve_probe_batch};
 
 /// Start a service. If `check_start_after` is true (API calls), validates that
@@ -29,14 +29,12 @@ pub async fn start(
         if svc.state == ServiceState::Running {
             drop(services);
             let target_statuses = emit_target_states(state, &[service_name]).await;
-            return Ok(OpResponse {
-                result: "ok".into(),
-                duration_ms: start_time.elapsed().as_millis() as u64,
-                error: None,
-                actions: OpActions::default(),
-                probes: indexmap::IndexMap::new(),
-                targets: target_statuses,
-            });
+            return Ok(OpResponse::ok(
+                start_time,
+                OpActions::default(),
+                indexmap::IndexMap::new(),
+                target_statuses,
+            ));
         }
         // Check start_after deps (API calls only; converge skips this)
         if check_start_after && !svc.start_after.is_empty() {
@@ -54,7 +52,7 @@ pub async fn start(
                         .unwrap_or("missing");
                     let suggestion = match dep_state_str {
                         "red" => format!("check {}", dep.service),
-                        "stale" => format!("reprobe {}", dep.service),
+                        "pending" => format!("reprobe {}", dep.service),
                         _ => format!("start {}", dep.service),
                     };
                     unmet.push(format!("{dep}: {dep_state_str} ({suggestion})"));
@@ -90,15 +88,28 @@ pub async fn start(
         svc.state = ServiceState::Running;
         svc.generation += 1;
         svc.log_since = log_since;
-        state.events.emit(Event::service_state(
-            service_name,
-            ServiceState::Running,
-            "red",
-        ));
+        // Mark all probes as Reprobing — even if already pending (ContainerStarted from watcher)
+        let mut changes = Vec::new();
+        for (probe_name, probe) in svc.probes.iter_mut() {
+            if !matches!(
+                probe.state,
+                ProbeState::Pending(crate::model::PendingReason::Reprobing)
+            ) {
+                let prev = probe.state.clone();
+                probe.prev_color = Some(prev.color());
+                let new_state = ProbeState::Pending(crate::model::PendingReason::Reprobing);
+                probe.state = new_state.clone();
+                changes.push((ProbeRef::new(service_name, probe_name), new_state, prev));
+            }
+        }
+        let mut probe_statuses_tmp = indexmap::IndexMap::new();
+        crate::ops::emit_propagated_changes(state, &services, &changes, &mut probe_statuses_tmp);
     }
+    crate::ops::emit_svc_display_states(state).await;
 
     // Probe probes using centralized probe dispatch
     let probe_configs: Vec<(String, ProbeConfig)>;
+    let generation: u64;
     {
         let services = state.services.read().await;
         let svc = &services[service_name];
@@ -107,8 +118,9 @@ pub async fn start(
             .iter()
             .map(|(name, probe_rt)| (name.clone(), probe_rt.probe_config.clone()))
             .collect();
+        generation = svc.generation;
     }
-    let backoff = state.config.read().await.defaults.probe_backoff.clone();
+    let backoff = state.config.defaults.probe_backoff.clone();
     let remaining = timeout.saturating_sub(start_time.elapsed());
 
     state.events.emit(Event::op_start("start", service_name));
@@ -117,7 +129,7 @@ pub async fn start(
     let docker = state.docker.inner();
     let mut futs = futures::stream::FuturesUnordered::new();
     for (probe_name, probe_config) in &probe_configs {
-        if matches!(probe_config, crate::config::ProbeConfig::Meta) {
+        if probe_config.is_meta() {
             continue;
         }
         let docker = docker.clone();
@@ -128,10 +140,11 @@ pub async fn start(
         let probe_name = probe_name.clone();
         futs.push(async move {
             let cr = ProbeRef::new(&svc, &probe_name);
-            let result = crate::probe::run_with_retry(
+            let mut result = crate::probe::run_with_retry(
                 &docker, &svc, &container, &pc, remaining, &backoff, log_since,
             )
             .await;
+            result.generation = generation;
             (cr, result)
         });
     }
@@ -149,12 +162,10 @@ pub async fn start(
     actions.started.push(service_name.to_string());
     let target_statuses = emit_target_states(state, &[service_name]).await;
 
-    Ok(OpResponse {
-        result: "ok".to_string(),
-        duration_ms: start_time.elapsed().as_millis() as u64,
-        error: None,
+    Ok(OpResponse::ok(
+        start_time,
         actions,
-        probes: probe_statuses,
-        targets: target_statuses,
-    })
+        probe_statuses,
+        target_statuses,
+    ))
 }

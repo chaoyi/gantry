@@ -4,22 +4,37 @@ use bollard::container::{StartContainerOptions, StopContainerOptions};
 use crate::error::{GantryError, Result};
 
 pub struct DockerClient {
-    docker: Docker,
+    docker: Option<Docker>,
 }
 
 impl DockerClient {
     pub fn connect() -> Result<Self> {
         let docker = Docker::connect_with_local_defaults()
             .map_err(|e| GantryError::Docker(e.to_string()))?;
-        Ok(Self { docker })
+        Ok(Self {
+            docker: Some(docker),
+        })
+    }
+
+    /// Dummy client for tests that don't call Docker. Panics with a clear
+    /// message if any Docker method is called.
+    #[cfg(test)]
+    pub fn dummy() -> Self {
+        Self { docker: None }
+    }
+
+    fn docker(&self) -> &Docker {
+        self.docker
+            .as_ref()
+            .expect("DockerClient::dummy() does not support Docker operations")
     }
 
     pub fn inner(&self) -> &Docker {
-        &self.docker
+        self.docker()
     }
 
     pub async fn start_container(&self, name: &str) -> Result<()> {
-        self.docker
+        self.docker()
             .start_container(name, None::<StartContainerOptions<String>>)
             .await?;
         Ok(())
@@ -27,12 +42,12 @@ impl DockerClient {
 
     pub async fn stop_container(&self, name: &str) -> Result<()> {
         let opts = StopContainerOptions { t: 10 };
-        self.docker.stop_container(name, Some(opts)).await?;
+        self.docker().stop_container(name, Some(opts)).await?;
         Ok(())
     }
 
     pub async fn inspect_container(&self, name: &str) -> Result<Option<ContainerInfo>> {
-        match self.docker.inspect_container(name, None).await {
+        match self.docker().inspect_container(name, None).await {
             Ok(info) => {
                 let running = info.state.as_ref().and_then(|s| s.running).unwrap_or(false);
                 let exit_code = info.state.as_ref().and_then(|s| s.exit_code).unwrap_or(0);

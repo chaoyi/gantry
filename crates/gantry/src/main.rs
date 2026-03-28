@@ -38,17 +38,10 @@ async fn serve(config_path: PathBuf, port: u16) -> error::Result<()> {
     let config = config::GantryConfig::load(&config_path)?;
     let dep_graph = graph::DependencyGraph::build(&config)?;
 
-    let all_svcs: Vec<String> = config.services.keys().cloned().collect();
-    let levels = dep_graph.topo_levels(&all_svcs);
-    let levels_str: Vec<String> = levels
-        .iter()
-        .map(|l| format!("[{}]", l.join(", ")))
-        .collect();
     tracing::info!(
-        "{} services, {} targets, startup: {}",
+        "{} services, {} targets",
         config.services.len(),
         config.targets.len(),
-        levels_str.join(" → "),
     );
 
     let mut runtime = model::RuntimeState::from_config(&config);
@@ -65,22 +58,27 @@ async fn serve(config_path: PathBuf, port: u16) -> error::Result<()> {
             Ok(Some(info)) => {
                 if info.running {
                     svc.state = model::ServiceState::Running;
-                    tracing::info!("[{svc_name}] running");
+                    tracing::info!("svc [{svc_name}] running (container up)");
                 } else if info.exit_code != 0 {
                     svc.state = model::ServiceState::Crashed;
-                    tracing::info!("[{svc_name}] crashed (exit {})", info.exit_code);
+                    tracing::info!("svc [{svc_name}] crashed (exit {})", info.exit_code);
                 } else {
-                    tracing::info!("[{svc_name}] stopped");
+                    tracing::info!("svc [{svc_name}] stopped");
                 }
             }
             Ok(None) => {
-                tracing::info!("[{svc_name}] container '{}' not found", svc.container);
+                tracing::info!("svc [{svc_name}] stopped (no container)");
             }
             Err(e) => {
-                tracing::info!("{svc_name}: failed to inspect: {e}");
+                tracing::warn!("svc [{svc_name}] inspect error: {e}");
             }
         }
     }
+
+    // Set initial probe states based on which containers are actually running.
+    // Running services with all deps running get Pending(Unchecked) probes;
+    // others stay Red.
+    dep_graph.initialize_probe_states(&mut runtime.services);
 
     let app_state = api::AppState::new(config, dep_graph, runtime, docker_client);
 

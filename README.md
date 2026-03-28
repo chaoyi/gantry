@@ -80,12 +80,28 @@ Both typically reference the same upstream probes but serve different purposes: 
 The main operation. Brings a target to green by looping:
 
 1. **Start** stopped services — each waits for its `start_after` deps, then starts and probes with retry. All in parallel.
-2. **Long-probe** stale and red probes with retry and backoff — the self-healing window. When a probe fails and the service has `restart_on_fail: true`, it's stopped immediately without waiting for slow probes.
+2. **Long-probe** pending and red probes with retry and backoff — the self-healing window. When a probe fails and the service has `restart_on_fail: true`, it's stopped immediately without waiting for slow probes.
 3. If all green → done. Otherwise, stopped services loop back to step 1. Each service restarts at most once.
 
 Options:
 - `?timeout=N` (default 60s) — total time cap. On timeout, returns immediately; in-flight probes are cancelled.
 - `?skip_restart=true` — run steps 1-2 only (diagnose without restarting).
+
+### State Model
+
+Three levels of abstraction, each showing only what matters:
+
+| Level | States | Purpose |
+|-------|--------|---------|
+| **Probe** | green, red, probing, pending, stopped | Detailed — individual health checks |
+| **Service** | green, red, stopped | Outcome — "is this service ready?" |
+| **Target** | green, red, inactive | Goal — "is everything I need ready?" |
+
+**Probe states:** `probing` = actively being checked (pulsing in UI); `pending` = needs check but not running yet; `stopped` = service not running.
+
+**Service reasons:** `stopped`, `crashed`, `probe failed`, `waiting for {service}`, `probes pending`.
+
+**Target reasons:** computed by walking the probe dependency chain to find root causes — `service redis stopped`, `probe db.port failed`, `target infra red`.
 
 ### Recovery Behaviors
 
@@ -107,7 +123,10 @@ Gantry watches Docker events via the socket. If a container dies or starts exter
 `GET /api` returns the full interface. One operation at a time (409 if busy). All POST operations accept `?timeout=N` in seconds (default 60).
 
 ```
-GET  /api/graph                       Dependency graph + live state
+GET  /api/status                      Health summary (states + reasons)
+GET  /api/service/:name               Service detail (probes, errors, logs, deps)
+GET  /api/target/:name                Target detail (root causes, service states)
+GET  /api/graph                       Full topology with probe-level detail
 
 POST /api/converge/target/:name       Bring a target to green
 POST /api/start/service/:name         Start and probe a service
@@ -116,10 +135,11 @@ POST /api/restart/service/:name       Stop → start → probe
 POST /api/reprobe/service/:name       Re-check probes
 POST /api/reprobe/target/:name        Re-check target probes
 POST /api/reprobe/all                 Re-check all probes
-POST /api/message                     Post to event stream
 
 WS   /api/ws                          Live events (snapshot on connect)
 ```
+
+**For AI callers:** `GET /api/status` for quick health check, `GET /api/service/:name` for diagnosis with probe errors and matched log lines, `POST /api/converge/target/:name` to fix issues. Most workflows need 1-3 calls.
 
 To pick up code changes: `docker compose build <svc> && docker compose up --no-start <svc>`, then `POST /api/restart/service/<svc>`.
 

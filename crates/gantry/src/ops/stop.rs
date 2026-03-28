@@ -2,11 +2,10 @@ use std::time::Instant;
 
 use crate::api::AppState;
 use crate::error::{GantryError, Result};
-use crate::events::Event;
-use crate::model::{ProbeRef, ProbeState, ServiceState};
+use crate::model::ServiceState;
 use crate::ops::{
     OpActions, OpResponse, ProbeStatus, emit_propagated_changes, emit_svc_display_states,
-    emit_target_states,
+    emit_target_states, mark_all_probes_red, propagate_all_pending,
 };
 
 pub async fn stop(state: &AppState, service_name: &str) -> Result<OpResponse> {
@@ -14,97 +13,58 @@ pub async fn stop(state: &AppState, service_name: &str) -> Result<OpResponse> {
     let mut actions = OpActions::default();
     let mut probe_statuses: indexmap::IndexMap<String, ProbeStatus> = indexmap::IndexMap::new();
 
-    {
-        let services = state.services.read().await;
-        if !services.contains_key(service_name) {
+    // Single write lock: check state + mark stopped + propagate.
+    // No gap between check and update → watcher can't intervene with "died external".
+    let (container_name, skip_docker_stop) = {
+        let mut services = state.services.write().await;
+        let Some(svc) = services.get_mut(service_name) else {
             return Err(GantryError::NotFound(format!(
                 "service '{service_name}' not found"
             )));
-        }
-        if services[service_name].state == ServiceState::Stopped {
+        };
+
+        if svc.state == ServiceState::Stopped {
             drop(services);
             let target_statuses = emit_target_states(state, &[service_name]).await;
-            return Ok(OpResponse {
-                result: "ok".into(),
-                duration_ms: start.elapsed().as_millis() as u64,
-                error: None,
+            return Ok(OpResponse::ok(
+                start,
                 actions,
-                probes: indexmap::IndexMap::new(),
-                targets: target_statuses,
-            });
+                indexmap::IndexMap::new(),
+                target_statuses,
+            ));
         }
-    }
 
-    // Mark stopped and propagate BEFORE docker stop — UI updates instantly via WS
-    let container_name;
-    {
-        let mut services = state.services.write().await;
-        let svc = services.get_mut(service_name).unwrap();
-        container_name = svc.container.clone();
+        let skip = svc.state == ServiceState::Crashed;
+        let container = svc.container.clone();
         svc.state = ServiceState::Stopped;
         svc.generation += 1;
-        svc.last_emitted_display = Some(crate::model::SvcDisplayState::Stopped);
-        state.events.emit(Event::service_state(
-            service_name,
-            ServiceState::Stopped,
-            "stopped",
-        ));
 
-        // Mark all probes red
-        let probe_names: Vec<String> = svc.probes.keys().cloned().collect();
-        for probe_name in &probe_names {
-            let probe_ref = ProbeRef::new(service_name, probe_name);
-            let probe = svc.probes.get_mut(probe_name).unwrap();
-            let prev = probe.state.clone();
-            probe.prev_color = Some(prev.color());
-            let new_state = ProbeState::Red(crate::model::RedReason::Stopped);
-            probe.state = new_state.clone();
-            if !prev.is_red() {
-                state.events.emit(Event::probe_state_change(
-                    &probe_ref,
-                    new_state,
-                    prev.clone(),
-                    "stopped",
-                ));
-            }
-            probe_statuses.insert(
-                probe_ref.to_string(),
-                ProbeStatus {
-                    state: "stopped".into(),
-                    prev: prev.as_str().into(),
-                    reason: Some("stopped".into()),
-                    probe_ms: None,
-                    error: None,
-                    logs: None,
-                },
-            );
-        }
-
-        // Propagate staleness downstream — probes already marked Red above
-        let graph = state.graph.read().await;
-        let mut changes = Vec::new();
-        for probe_name in &probe_names {
-            let probe_key = format!("{service_name}.{probe_name}");
-            graph.propagate_staleness(&probe_key, &mut services, &mut changes);
-        }
+        // Mark all probes red — collect changes for unified emission
+        let changes = mark_all_probes_red(service_name, svc, || crate::model::RedReason::Stopped);
         emit_propagated_changes(state, &services, &changes, &mut probe_statuses);
-    }
 
+        // Propagate pending downstream
+        let changes = propagate_all_pending(&state.graph, service_name, &mut services);
+        emit_propagated_changes(state, &services, &changes, &mut probe_statuses);
+
+        (container, skip)
+    };
+
+    // Emit display states for all services (some may change due to propagation)
     actions.stopped.push(service_name.to_string());
-    let all_svcs: Vec<String> = state.services.read().await.keys().cloned().collect();
-    let all_refs: Vec<&str> = all_svcs.iter().map(|s| s.as_str()).collect();
-    emit_svc_display_states(state, &all_refs).await;
+    emit_svc_display_states(state).await;
     let target_statuses = emit_target_states(state, &[service_name]).await;
 
-    // Now actually stop the container — state already propagated
-    state.docker.stop_container(&container_name).await?;
+    // Stop the container (blocking — AI callers need to know when it's done).
+    // Errors are ignored since state is already correct.
+    if !skip_docker_stop && let Err(e) = state.docker.stop_container(&container_name).await {
+        tracing::warn!("svc [{service_name}] docker stop error (ignored): {e}");
+    }
 
-    Ok(OpResponse {
-        result: "ok".to_string(),
-        duration_ms: start.elapsed().as_millis() as u64,
-        error: None,
+    Ok(OpResponse::ok(
+        start,
         actions,
-        probes: probe_statuses,
-        targets: target_statuses,
-    })
+        probe_statuses,
+        target_statuses,
+    ))
 }

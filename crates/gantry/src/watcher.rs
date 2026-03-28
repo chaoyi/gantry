@@ -5,10 +5,10 @@ use bollard::system::EventsOptions;
 use futures::StreamExt;
 
 use crate::api::AppState;
-use crate::events::Event;
-use crate::model::{ProbeRef, ProbeState, ServiceState};
+use crate::model::ServiceState;
 use crate::ops::{
     ProbeStatus, emit_propagated_changes, emit_svc_display_states, emit_target_states,
+    mark_all_probes_pending, mark_all_probes_red, propagate_all_pending,
 };
 
 /// Watch Docker events and update gantry state when containers start/stop externally.
@@ -28,7 +28,6 @@ pub async fn watch_docker_events(state: Arc<AppState>) {
         let Some(action) = event.action.as_deref() else {
             continue;
         };
-        // Container name from event actor attributes
         let container_name = event
             .actor
             .as_ref()
@@ -39,7 +38,6 @@ pub async fn watch_docker_events(state: Arc<AppState>) {
             continue;
         };
 
-        // Find matching gantry service by container name
         let svc_name = {
             let services = state.services.read().await;
             services
@@ -59,9 +57,8 @@ pub async fn watch_docker_events(state: Arc<AppState>) {
     }
 }
 
-/// Container died: mark service stopped + probes red + propagate.
+/// Container died: mark service crashed + probes red + propagate.
 async fn handle_die(state: &AppState, svc_name: &str) {
-    tracing::info!("[{svc_name}] container died (external)");
     let mut probe_statuses: indexmap::IndexMap<String, ProbeStatus> = indexmap::IndexMap::new();
 
     {
@@ -70,60 +67,28 @@ async fn handle_die(state: &AppState, svc_name: &str) {
             return;
         };
         if svc.state == ServiceState::Stopped {
-            return; // already stopped (e.g., gantry stopped it)
+            return; // gantry stopped it — not an external death
         }
-        svc.state = ServiceState::Stopped;
-        state.events.emit(Event::service_state(
-            svc_name,
-            ServiceState::Stopped,
-            "stopped",
-        ));
+        tracing::debug!("watcher: [{svc_name}] container died");
+        svc.state = ServiceState::Crashed;
+        svc.generation += 1;
 
-        let probe_names: Vec<String> = svc.probes.keys().cloned().collect();
-        for probe_name in &probe_names {
-            let probe_ref = ProbeRef::new(svc_name, probe_name);
-            let probe = svc.probes.get_mut(probe_name).unwrap();
-            let prev = probe.state.clone();
-            probe.prev_color = Some(prev.color());
-            let new_state = ProbeState::Red(crate::model::RedReason::ContainerDied);
-            probe.state = new_state.clone();
-            state.events.emit(Event::probe_state_change(
-                &probe_ref,
-                new_state,
-                prev.clone(),
-                "stopped",
-            ));
-            probe_statuses.insert(
-                probe_ref.to_string(),
-                ProbeStatus {
-                    state: "stopped".into(),
-                    prev: prev.as_str().into(),
-                    reason: Some("container died".into()),
-                    probe_ms: None,
-                    error: None,
-                    logs: None,
-                },
-            );
-        }
-
-        let graph = state.graph.read().await;
-        let mut changes = Vec::new();
-        for probe_name in &probe_names {
-            let probe_key = format!("{svc_name}.{probe_name}");
-            graph.propagate_staleness(&probe_key, &mut services, &mut changes);
-        }
+        // Mark all probes red — collect changes for unified emission
+        let changes = mark_all_probes_red(svc_name, svc, || crate::model::RedReason::ContainerDied);
         emit_propagated_changes(state, &services, &changes, &mut probe_statuses);
+
+        // Propagate pending downstream
+        let prop_changes = propagate_all_pending(&state.graph, svc_name, &mut services);
+        emit_propagated_changes(state, &services, &prop_changes, &mut probe_statuses);
     }
 
-    let all_svcs: Vec<String> = state.services.read().await.keys().cloned().collect();
-    let all_refs: Vec<&str> = all_svcs.iter().map(|s| s.as_str()).collect();
-    emit_svc_display_states(state, &all_refs).await;
+    emit_svc_display_states(state).await;
     emit_target_states(state, &[svc_name]).await;
 }
 
-/// Container started: mark service running + reprobe to get green/red.
+/// Container started: mark service running + probes pending + propagate recovery.
 async fn handle_start(state: &AppState, svc_name: &str) {
-    tracing::info!("[{svc_name}] container started (external)");
+    tracing::debug!("watcher: [{svc_name}] container started");
     let mut probe_statuses: indexmap::IndexMap<String, ProbeStatus> = indexmap::IndexMap::new();
 
     {
@@ -132,59 +97,30 @@ async fn handle_start(state: &AppState, svc_name: &str) {
             return;
         };
         if svc.state == ServiceState::Running {
-            return; // already running (e.g., gantry started it)
+            return;
         }
         svc.state = ServiceState::Running;
-        state.events.emit(Event::service_state(
-            svc_name,
-            ServiceState::Running,
-            "running",
-        ));
+        svc.generation += 1;
 
-        // Mark all probes stale for reprobing, track those that were Red
-        let mut was_red: Vec<String> = Vec::new();
-        for (probe_name, probe) in svc.probes.iter_mut() {
-            if !probe.state.is_stale() {
-                let prev = probe.state.clone();
-                if prev.is_red() {
-                    was_red.push(probe_name.clone());
-                }
-                probe.prev_color = Some(prev.color());
-                let new_state = ProbeState::Stale(crate::model::StaleReason::ContainerStarted);
-                probe.state = new_state.clone();
-                let probe_ref = ProbeRef::new(svc_name, probe_name);
-                state.events.emit(Event::probe_state_change(
-                    &probe_ref,
-                    new_state,
-                    prev.clone(),
-                    "stale",
-                ));
-                probe_statuses.insert(
-                    probe_ref.to_string(),
-                    ProbeStatus {
-                        state: "stale".into(),
-                        prev: prev.as_str().into(),
-                        reason: Some("container started externally".into()),
-                        probe_ms: None,
-                        error: None,
-                        logs: None,
-                    },
-                );
-            }
-        }
+        let changes = mark_all_probes_pending(svc_name, svc, || {
+            crate::model::PendingReason::ContainerStarted
+        });
+        let was_red: Vec<String> = changes
+            .iter()
+            .filter(|(_, _, prev)| prev.is_red())
+            .map(|(pr, _, _)| pr.probe.clone())
+            .collect();
+        emit_propagated_changes(state, &services, &changes, &mut probe_statuses);
 
-        // Propagate recovery to dependents for probes that were Red
-        let graph = state.graph.read().await;
-        let mut changes = Vec::new();
+        let graph = &state.graph;
+        let mut prop_changes = Vec::new();
         for probe_name in &was_red {
             let probe_key = format!("{svc_name}.{probe_name}");
-            graph.propagate_recovery(&probe_key, &mut services, &mut changes);
+            graph.propagate_recovery(&probe_key, &mut services, &mut prop_changes);
         }
-        emit_propagated_changes(state, &services, &changes, &mut probe_statuses);
+        emit_propagated_changes(state, &services, &prop_changes, &mut probe_statuses);
     }
 
-    let all_svcs: Vec<String> = state.services.read().await.keys().cloned().collect();
-    let all_refs: Vec<&str> = all_svcs.iter().map(|s| s.as_str()).collect();
-    emit_svc_display_states(state, &all_refs).await;
+    emit_svc_display_states(state).await;
     emit_target_states(state, &[svc_name]).await;
 }

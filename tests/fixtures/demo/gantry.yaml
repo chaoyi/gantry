@@ -1,18 +1,25 @@
-# Demo: 4 converge recovery behaviors
+# Demo: 8 services in 2 isolated groups
 #
-# crash-svc:  exits when redis down     → restart fixes it
-# stuck-svc:  broken when postgres down  → failure pattern detected, restart fixes it
-# slow-heal:  reconnects in ~20s         → restart is faster
-# fast-heal:  reconnects in ~2s          → self-heals, no restart needed
+# ── Group 1: Recovery behaviors (targets: infra, app) ──
+#   postgres, redis:  infrastructure
+#   crash-svc:   exits when redis down        (restart_on_fail: true)
+#   stuck-svc:   broken when postgres down    (restart_on_fail: true)
+#   slow-heal:   reconnects in ~20s           (restart_on_fail: true)
+#   fast-heal:   reconnects in ~2s            (restart_on_fail: false)
+#
+# ── Group 2: Flaky services (target: unstable) ──
+#   flaky-api:   crashes randomly after 10-30s  (restart_on_fail: true)
+#   doomed:      stops responding after ~5s     (restart_on_fail: false → converge fails)
 
 services:
+  # ── Group 1: infra ──
   postgres:
     container: demo-postgres
     probes:
       port:
-        probe: { type: tcp, host: postgres, port: 5432, timeout: 8s }
+        probe: { type: tcp, host: postgres, port: 5432, timeout: 15s }
       ready:
-        probe: { type: log, success: "ready to accept connections", timeout: 10s }
+        probe: { type: log, success: "ready to accept connections", timeout: 15s }
         depends_on: [postgres.port]
 
   redis:
@@ -24,6 +31,7 @@ services:
         probe: { type: log, success: "Ready to accept connections", timeout: 8s }
         depends_on: [redis.port]
 
+  # ── Group 1: app services ──
   crash-svc:
     container: demo-crash-svc
     start_after: [redis.ready]
@@ -51,10 +59,10 @@ services:
     start_after: [redis.ready]
     probes:
       dep:
-        probe: { type: log, success: "dependency connected", failure: "dependency lost", timeout: 5s }
+        probe: { type: log, success: "dependency connected", failure: "dependency lost", timeout: 30s }
         depends_on: [redis.ready]
       http:
-        probe: { type: tcp, host: slow-heal, port: 8080, timeout: 5s }
+        probe: { type: tcp, host: slow-heal, port: 8080, timeout: 30s }
         depends_on: [slow-heal.dep]
 
   fast-heal:
@@ -69,12 +77,41 @@ services:
         probe: { type: tcp, host: fast-heal, port: 8080, timeout: 5s }
         depends_on: [fast-heal.dep]
 
+  # ── Group 2: flaky services (no shared infra) ──
+  flaky-api:
+    container: demo-flaky-api
+    probes:
+      dep:
+        probe: { type: log, success: "dependency connected", timeout: 5s }
+      http:
+        probe: { type: tcp, host: flaky-api, port: 8080, timeout: 5s }
+        depends_on: [flaky-api.dep]
+
+  doomed:
+    container: demo-doomed
+    restart_on_fail: false
+    start_after: [flaky-api.ready]
+    probes:
+      dep:
+        probe: { type: log, success: "dependency connected", timeout: 5s }
+        depends_on: [flaky-api.ready]
+      http:
+        probe: { type: tcp, host: doomed, port: 8080, timeout: 8s }
+        depends_on: [doomed.dep]
+
 targets:
+  # Group 1
   infra:
     probes: [postgres.ready, redis.ready]
   app:
     probes: [crash-svc.ready, stuck-svc.ready, slow-heal.ready, fast-heal.ready]
     depends_on: [infra]
+  # Group 2 (fully isolated from group 1)
+  unstable:
+    probes: [doomed.ready]
+    depends_on: [flaky-api-target]
+  flaky-api-target:
+    probes: [flaky-api.ready]
 
 defaults:
   tcp_probe_timeout: 5s
