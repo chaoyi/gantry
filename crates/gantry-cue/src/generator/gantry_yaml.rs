@@ -65,7 +65,7 @@ struct GantryBackoff {
 /// Generate gantry.yaml content from a SetupJson.
 ///
 /// Maps CUE's "probes" to gantry's "probes" field name.
-pub fn generate_gantry_yaml(setup: &SetupJson, setup_name: &str) -> Result<String> {
+pub fn generate_gantry_yaml(setup: &SetupJson) -> Result<String> {
     let mut services = IndexMap::new();
 
     for (svc_name, svc_def) in &setup.services {
@@ -91,7 +91,7 @@ pub fn generate_gantry_yaml(setup: &SetupJson, setup_name: &str) -> Result<Strin
         services.insert(
             svc_name.clone(),
             GantryService {
-                container: format!("{setup_name}-{svc_name}"),
+                container: svc_def.container_name.clone(),
                 start_after: svc_def.start_after.clone(),
                 restart_on_fail: svc_def.restart_on_fail,
                 probes,
@@ -140,8 +140,10 @@ mod tests {
 
     fn sample_json() -> &'static str {
         r#"{
+          "name": "demo",
           "services": {
             "db": {
+              "container_name": "demo-db",
               "image": "postgres:16",
               "env": {"POSTGRES_PASSWORD": "dev"},
               "ports": ["5432"],
@@ -154,6 +156,7 @@ mod tests {
               }
             },
             "app": {
+              "container_name": "demo-app",
               "image": {"build": {"context": ".", "dockerfile": "Dockerfile"}},
               "env": {"DATABASE_URL": "postgres://db:5432/app"},
               "ports": ["8080"],
@@ -181,7 +184,7 @@ mod tests {
     fn generates_valid_yaml() {
         let setup: crate::generator::schema::SetupJson =
             serde_json::from_str(sample_json()).unwrap();
-        let yaml = generate_gantry_yaml(&setup, "demo").unwrap();
+        let yaml = generate_gantry_yaml(&setup).unwrap();
 
         assert!(yaml.contains("container: demo-db"));
         assert!(yaml.contains("container: demo-app"));
@@ -196,7 +199,7 @@ mod tests {
     fn round_trip_through_gantry_config() {
         let setup: crate::generator::schema::SetupJson =
             serde_json::from_str(sample_json()).unwrap();
-        let yaml = generate_gantry_yaml(&setup, "demo").unwrap();
+        let yaml = generate_gantry_yaml(&setup).unwrap();
 
         // The supervisor's GantryConfig must be able to parse our output
         let config: gantry::config::GantryConfig = serde_yaml::from_str(&yaml).unwrap();
@@ -223,7 +226,7 @@ mod tests {
     fn preserves_structure() {
         let setup: crate::generator::schema::SetupJson =
             serde_json::from_str(sample_json()).unwrap();
-        let yaml = generate_gantry_yaml(&setup, "demo").unwrap();
+        let yaml = generate_gantry_yaml(&setup).unwrap();
 
         let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
 
@@ -249,8 +252,10 @@ mod tests {
     #[test]
     fn no_defaults_when_absent() {
         let json = r#"{
+          "name": "test",
           "services": {
             "db": {
+              "container_name": "test-db",
               "image": "postgres:16",
               "probes": {
                 "port": {"probe": {"type": "tcp", "port": 5432}}
@@ -260,7 +265,7 @@ mod tests {
           "targets": {}
         }"#;
         let setup: crate::generator::schema::SetupJson = serde_json::from_str(json).unwrap();
-        let yaml = generate_gantry_yaml(&setup, "test").unwrap();
+        let yaml = generate_gantry_yaml(&setup).unwrap();
         assert!(!yaml.contains("defaults"));
     }
 }

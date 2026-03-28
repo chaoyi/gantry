@@ -2,3 +2,4 @@
 **/elk.bundled.js
 **/output/
 **/cue.mod/pkg/
+*.pyc

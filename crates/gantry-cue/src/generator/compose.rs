@@ -63,7 +63,8 @@ struct ComposeBuild {
 }
 
 /// Generate docker-compose.yml content from a SetupJson.
-pub fn generate_compose(setup: &SetupJson, setup_name: &str) -> Result<String> {
+pub fn generate_compose(setup: &SetupJson) -> Result<String> {
+    let setup_name = &setup.name;
     let mut services = IndexMap::new();
 
     // Inject gantry supervisor service
@@ -120,7 +121,7 @@ pub fn generate_compose(setup: &SetupJson, setup_name: &str) -> Result<String> {
                 build,
                 command: svc_def.command.clone(),
                 entrypoint: svc_def.entrypoint.clone(),
-                container_name: Some(format!("{setup_name}-{svc_name}")),
+                container_name: Some(svc_def.container_name.clone()),
                 user: svc_def.user.clone(),
                 working_dir: svc_def.working_dir.clone(),
                 hostname: svc_def.hostname.clone(),
@@ -165,8 +166,10 @@ mod tests {
 
     fn sample_json() -> &'static str {
         r#"{
+          "name": "demo",
           "services": {
             "db": {
+              "container_name": "demo-db",
               "image": "postgres:16",
               "env": {"POSTGRES_PASSWORD": "dev"},
               "ports": ["5432"],
@@ -175,6 +178,7 @@ mod tests {
               }
             },
             "app": {
+              "container_name": "demo-app",
               "image": {"build": {"context": ".", "dockerfile": "Dockerfile"}},
               "env": {"DATABASE_URL": "postgres://db:5432/app"},
               "ports": ["8080"],
@@ -190,7 +194,7 @@ mod tests {
     fn generates_compose_yaml() {
         let setup: crate::generator::schema::SetupJson =
             serde_json::from_str(sample_json()).unwrap();
-        let yaml = generate_compose(&setup, "demo").unwrap();
+        let yaml = generate_compose(&setup).unwrap();
 
         // Parse back to verify structure
         let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
@@ -208,7 +212,7 @@ mod tests {
     fn gantry_service_correct() {
         let setup: crate::generator::schema::SetupJson =
             serde_json::from_str(sample_json()).unwrap();
-        let yaml = generate_compose(&setup, "demo").unwrap();
+        let yaml = generate_compose(&setup).unwrap();
 
         assert!(yaml.contains("ghcr.io/chaoyi/gantry:latest"));
         assert!(!yaml.contains("command:"));
@@ -222,7 +226,7 @@ mod tests {
     fn prebuilt_image_has_no_build() {
         let setup: crate::generator::schema::SetupJson =
             serde_json::from_str(sample_json()).unwrap();
-        let yaml = generate_compose(&setup, "demo").unwrap();
+        let yaml = generate_compose(&setup).unwrap();
 
         // Parse and check db service
         let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
@@ -235,7 +239,7 @@ mod tests {
     fn build_image_has_no_image_field() {
         let setup: crate::generator::schema::SetupJson =
             serde_json::from_str(sample_json()).unwrap();
-        let yaml = generate_compose(&setup, "demo").unwrap();
+        let yaml = generate_compose(&setup).unwrap();
 
         let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
         let app = &parsed["services"]["app"];
@@ -248,18 +252,18 @@ mod tests {
     fn container_names() {
         let setup: crate::generator::schema::SetupJson =
             serde_json::from_str(sample_json()).unwrap();
-        let yaml = generate_compose(&setup, "mysetup").unwrap();
+        let yaml = generate_compose(&setup).unwrap();
 
-        assert!(yaml.contains("container_name: mysetup-db"));
-        assert!(yaml.contains("container_name: mysetup-app"));
-        assert!(yaml.contains("container_name: mysetup-gantry"));
+        assert!(yaml.contains("container_name: demo-db"));
+        assert!(yaml.contains("container_name: demo-app"));
+        assert!(yaml.contains("container_name: demo-gantry"));
     }
 
     #[test]
     fn no_depends_on_or_healthcheck() {
         let setup: crate::generator::schema::SetupJson =
             serde_json::from_str(sample_json()).unwrap();
-        let yaml = generate_compose(&setup, "demo").unwrap();
+        let yaml = generate_compose(&setup).unwrap();
 
         assert!(!yaml.contains("depends_on"));
         assert!(!yaml.contains("healthcheck"));
@@ -269,7 +273,7 @@ mod tests {
     fn environment_no_host_ports() {
         let setup: crate::generator::schema::SetupJson =
             serde_json::from_str(sample_json()).unwrap();
-        let yaml = generate_compose(&setup, "demo").unwrap();
+        let yaml = generate_compose(&setup).unwrap();
 
         assert!(yaml.contains("POSTGRES_PASSWORD"));
         assert!(yaml.contains("DATABASE_URL"));
@@ -283,8 +287,10 @@ mod tests {
     #[test]
     fn new_compose_fields_pass_through() {
         let json = r#"{
+          "name": "test",
           "services": {
             "vpn": {
+              "container_name": "test-vpn",
               "image": "wireguard:latest",
               "entrypoint": ["/init.sh", "--start"],
               "user": "1000:1000",
@@ -306,7 +312,7 @@ mod tests {
           }
         }"#;
         let setup: crate::generator::schema::SetupJson = serde_json::from_str(json).unwrap();
-        let yaml = generate_compose(&setup, "test").unwrap();
+        let yaml = generate_compose(&setup).unwrap();
 
         // Verify new fields appear in output
         assert!(yaml.contains("entrypoint:"), "missing entrypoint");
@@ -343,7 +349,7 @@ mod tests {
         // Existing sample_json has none of the new fields — they should not appear
         let setup: crate::generator::schema::SetupJson =
             serde_json::from_str(sample_json()).unwrap();
-        let yaml = generate_compose(&setup, "demo").unwrap();
+        let yaml = generate_compose(&setup).unwrap();
 
         assert!(
             !yaml.contains("entrypoint:"),

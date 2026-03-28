@@ -5,6 +5,7 @@ use serde_json::Value;
 /// Top-level JSON from `cue export`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SetupJson {
+    pub name: String,
     pub services: IndexMap<String, ServiceDef>,
     #[serde(default)]
     pub targets: IndexMap<String, TargetDef>,
@@ -27,6 +28,7 @@ pub struct VolumeConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct ServiceDef {
+    pub container_name: String,
     pub image: ImageDef,
     #[serde(default)]
     pub config: Option<Value>,
@@ -147,8 +149,10 @@ mod tests {
 
     fn spec_json() -> &'static str {
         r#"{
+          "name": "test",
           "services": {
             "app": {
+              "container_name": "test-app",
               "image": {"build": {"context": ".", "dockerfile": "Dockerfile"}},
               "env": {"PORT": "8080", "DATABASE_URL": "postgres://db:5432/app"},
               "ports": ["8080"],
@@ -207,8 +211,10 @@ mod tests {
     #[test]
     fn parse_image_prebuilt() {
         let json = r#"{
+          "name": "test",
           "services": {
             "db": {
+              "container_name": "test-db",
               "image": "postgres:16",
               "probes": {
                 "port": {"probe": {"type": "tcp", "port": 5432}}
@@ -275,7 +281,7 @@ mod tests {
 
     #[test]
     fn parse_minimal() {
-        let json = r#"{"services": {}}"#;
+        let json = r#"{"name": "test", "services": {}}"#;
         let setup: SetupJson = serde_json::from_str(json).unwrap();
         assert!(setup.services.is_empty());
         assert!(setup.targets.is_empty());
@@ -286,8 +292,10 @@ mod tests {
     #[test]
     fn parse_new_compose_fields() {
         let json = r#"{
+          "name": "test",
           "services": {
             "vpn": {
+              "container_name": "test-vpn",
               "image": "wireguard:latest",
               "entrypoint": "/init.sh",
               "user": "1000:1000",
@@ -334,8 +342,10 @@ mod tests {
     #[test]
     fn parse_entrypoint_array() {
         let json = r#"{
+          "name": "test",
           "services": {
             "app": {
+              "container_name": "test-app",
               "image": "myapp:latest",
               "entrypoint": ["/bin/sh", "-c", "echo hello"],
               "probes": {}

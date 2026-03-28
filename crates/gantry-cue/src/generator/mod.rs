@@ -14,13 +14,6 @@ use schema::{ImageDef, SetupJson};
 ///
 /// Pipeline: cue export → JSON → validate → generate files.
 pub fn generate(setup_dir: &Path) -> Result<()> {
-    let setup_name = setup_dir
-        .file_name()
-        .ok_or_else(|| GantryError::Config("invalid setup directory".into()))?
-        .to_str()
-        .ok_or_else(|| GantryError::Config("non-UTF8 setup directory name".into()))?
-        .to_string();
-
     let json_str = run_cue_export(setup_dir)?;
 
     // Use the project root (parent of the setup dir's parent) as base for file resolution.
@@ -29,26 +22,21 @@ pub fn generate(setup_dir: &Path) -> Result<()> {
     let base_dir = std::env::current_dir()
         .map_err(|e| GantryError::Operation(format!("cannot determine cwd: {e}")))?;
 
-    generate_from_json(&json_str, &setup_name, &base_dir)
+    generate_from_json(&json_str, &base_dir)
 }
 
 /// Generate output from pre-exported JSON. Testable without CUE.
-pub fn generate_from_json(json_str: &str, setup_name: &str, base_dir: &Path) -> Result<()> {
+pub fn generate_from_json(json_str: &str, base_dir: &Path) -> Result<()> {
     let setup: SetupJson = serde_json::from_str(json_str)
         .map_err(|e| GantryError::Config(format!("failed to parse CUE export: {e}")))?;
 
     validate::validate(&setup, base_dir)?;
 
-    let output_dir = base_dir.join("output").join(setup_name);
-    write_output(&setup, setup_name, base_dir, &output_dir)
+    let output_dir = base_dir.join("output").join(&setup.name);
+    write_output(&setup, base_dir, &output_dir)
 }
 
-fn write_output(
-    setup: &SetupJson,
-    setup_name: &str,
-    base_dir: &Path,
-    output_dir: &Path,
-) -> Result<()> {
+fn write_output(setup: &SetupJson, base_dir: &Path, output_dir: &Path) -> Result<()> {
     // Clean and create output directory
     if output_dir.exists() {
         std::fs::remove_dir_all(output_dir)?;
@@ -56,11 +44,11 @@ fn write_output(
     std::fs::create_dir_all(output_dir)?;
 
     // Generate docker-compose.yml
-    let compose_yaml = compose::generate_compose(setup, setup_name)?;
+    let compose_yaml = compose::generate_compose(setup)?;
     std::fs::write(output_dir.join("docker-compose.yml"), compose_yaml)?;
 
     // Generate gantry.yaml
-    let gantry_yaml = gantry_yaml::generate_gantry_yaml(setup, setup_name)?;
+    let gantry_yaml = gantry_yaml::generate_gantry_yaml(setup)?;
     std::fs::write(output_dir.join("gantry.yaml"), gantry_yaml)?;
 
     // Process each service's files
@@ -120,8 +108,10 @@ mod tests {
 
     fn sample_json() -> &'static str {
         r#"{
+          "name": "demo",
           "services": {
             "db": {
+              "container_name": "demo-db",
               "image": "postgres:16",
               "env": {"POSTGRES_PASSWORD": "dev"},
               "ports": ["5432"],
@@ -134,6 +124,7 @@ mod tests {
               }
             },
             "app": {
+              "container_name": "demo-app",
               "image": {"build": {"context": "app-ctx", "dockerfile": "Dockerfile"}},
               "env": {"DATABASE_URL": "postgres://db:5432/app"},
               "ports": ["8080"],
@@ -178,7 +169,7 @@ mod tests {
         )
         .unwrap();
 
-        generate_from_json(sample_json(), "demo", &tmp).unwrap();
+        generate_from_json(sample_json(), &tmp).unwrap();
 
         let out = tmp.join("output/demo");
 
@@ -215,7 +206,7 @@ mod tests {
     #[test]
     fn generate_invalid_json() {
         let tmp = make_tmp("badjson");
-        let result = generate_from_json("not json", "test", &tmp);
+        let result = generate_from_json("not json", &tmp);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("failed to parse"));
         let _ = fs::remove_dir_all(&tmp);
@@ -225,7 +216,7 @@ mod tests {
     fn generate_missing_source_files() {
         let tmp = make_tmp("missingsrc");
         // Don't create the Dockerfile — validation should fail
-        let result = generate_from_json(sample_json(), "test", &tmp);
+        let result = generate_from_json(sample_json(), &tmp);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
         let _ = fs::remove_dir_all(&tmp);

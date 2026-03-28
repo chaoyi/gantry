@@ -18,6 +18,7 @@ let _workerPort = 8080
 let _routesFile = "routes-\(_env).conf"
 
 gantry.#Setup & {
+	name: "demo"
 	input: {
 		db:    _db
 		cache: _cache

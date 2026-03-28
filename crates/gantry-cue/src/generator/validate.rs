@@ -64,6 +64,7 @@ mod tests {
 
     fn minimal_setup() -> SetupJson {
         SetupJson {
+            name: "test".into(),
             services: IndexMap::new(),
             targets: IndexMap::new(),
             defaults: None,
@@ -90,6 +91,7 @@ mod tests {
         services.insert(
             "app".into(),
             ServiceDef {
+                container_name: "test-app".into(),
                 config: None,
                 image: ImageDef::Build {
                     build: BuildDef {
@@ -119,6 +121,7 @@ mod tests {
             },
         );
         let setup = SetupJson {
+            name: "test".into(),
             services,
             targets: IndexMap::new(),
             defaults: None,
@@ -141,6 +144,7 @@ mod tests {
         services.insert(
             "app".into(),
             ServiceDef {
+                container_name: "test-app".into(),
                 config: None,
                 image: ImageDef::Prebuilt("nginx".into()),
                 env: IndexMap::new(),
@@ -170,6 +174,7 @@ mod tests {
             },
         );
         let setup = SetupJson {
+            name: "test".into(),
             services,
             targets: IndexMap::new(),
             defaults: None,
@@ -192,6 +197,7 @@ mod tests {
         services.insert(
             "app".into(),
             ServiceDef {
+                container_name: "test-app".into(),
                 config: None,
                 image: ImageDef::Build {
                     build: BuildDef {
@@ -234,6 +240,7 @@ mod tests {
             },
         );
         let setup = SetupJson {
+            name: "test".into(),
             services,
             targets: IndexMap::new(),
             defaults: None,
@@ -260,6 +267,7 @@ mod tests {
         services.insert(
             "app".into(),
             ServiceDef {
+                container_name: "test-app".into(),
                 config: None,
                 image: ImageDef::Build {
                     build: BuildDef {
@@ -302,6 +310,7 @@ mod tests {
             },
         );
         let setup = SetupJson {
+            name: "test".into(),
             services,
             targets: IndexMap::new(),
             defaults: None,

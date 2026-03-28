@@ -6,6 +6,7 @@ import "strings"
 
 #Service: {
 	config?:          _
+	container_name?:  string
 	image:            #Image
 	env?:             {[string]: string}
 	ports?:           [...string]
@@ -85,8 +86,9 @@ import "strings"
 //   }
 
 #Setup: {
+	name:   string
 	input: {[string]: #Service}
-	services: (#Qualify & {"input": input}).output
+	services: (#Qualify & {_name_: name, "input": input}).output
 	targets?: {[string]: #Target}
 	defaults?: #Defaults
 	// Shared files rendered to output/shared/, not belonging to any service.
@@ -97,10 +99,13 @@ import "strings"
 // ── Qualify (internal) ──
 
 #Qualify: {
+	_name_: string
 	input: {[string]: #Service}
 	output: {
 		for svcName, svc in input {
 			"\(svcName)": {
+				if svc.container_name == _|_ {container_name: "\(_name_)-\(svcName)"}
+				if svc.container_name != _|_ {container_name: svc.container_name}
 				if svc.config != _|_ {config: svc.config}
 				image: svc.image
 				if svc.env != _|_ {env: svc.env}
